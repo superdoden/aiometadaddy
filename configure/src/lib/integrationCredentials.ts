@@ -1,3 +1,5 @@
+import { adminAuthHeaders } from '@/lib/adminRequestAuth';
+
 export type IntegrationProvider = 'trakt' | 'simkl' | 'anilist' | 'mal' | 'movielens';
 
 interface PersistArgs {
@@ -22,7 +24,7 @@ export async function persistIntegrationCredential(
   try {
     const response = await fetch('/api/integrations/credential', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...adminAuthHeaders() },
       body: JSON.stringify({ userUUID, password, provider, tokenId, ...(profile ? { profile } : {}) }),
     });
     const data = await response.json().catch(() => ({}));
@@ -38,7 +40,7 @@ export async function disconnectCardAccount(path: string, userUUID: string, prof
   try {
     const response = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...adminAuthHeaders() },
       body: JSON.stringify({ userUUID, profile, password }),
     });
     if (response.ok || response.status === 404) return { ok: true };

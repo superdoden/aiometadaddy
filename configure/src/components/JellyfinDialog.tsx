@@ -25,6 +25,8 @@ import { MAX_TAG_NAME_LENGTH, type CatalogConfig, type JellyfinUser, type TagDef
 import { UserAccounts } from "@/components/jellyfin/UserAccounts";
 import { CARD_SERVICES, connectedServices, handoffNameClash, isHolder, trackerOptionsFor, watchlistOptionsFor } from "@/lib/cardAccounts";
 import { disconnectCardAccount } from "@/lib/integrationCredentials";
+import { adminAuthHeaders } from "@/lib/adminRequestAuth";
+import { StreamPicker, type StreamOption } from "@/components/jellyfin/StreamPicker";
 
 /**
  * Typed by hand on a TV remote as often as pasted, so the alphabet leaves out
@@ -107,13 +109,14 @@ interface UserRowProps {
   watchlistOptions: WatchlistOption[];
   hasPmdb: boolean;
   showHandoff?: boolean;
+  streamOptions?: StreamOption[];
   onChange: (patch: Partial<JellyfinUser>) => void;
   onRemove?: () => void;
   onForget?: () => void;
   children?: ReactNode;
 }
 
-function UserRow({ name, avatar, main, user, allTags, catalogCount, trackerOptions, watchlistOptions, hasPmdb, showHandoff, onChange, onRemove, onForget, children }: UserRowProps) {
+function UserRow({ name, avatar, main, user, allTags, catalogCount, trackerOptions, watchlistOptions, hasPmdb, showHandoff, streamOptions, onChange, onRemove, onForget, children }: UserRowProps) {
   const chosen = user?.tags ?? [];
   const toggleTag = (tag: string) =>
     onChange({ tags: chosen.includes(tag) ? chosen.filter((t) => t !== tag) : [...chosen, tag] });
@@ -244,12 +247,16 @@ function UserRow({ name, avatar, main, user, allTags, catalogCount, trackerOptio
         {!main && (
           <div className="space-y-1.5">
             <Label className="text-xs font-medium">Stream addon</Label>
+            {streamOptions ? (
+              <StreamPicker value={user?.streamUrl} options={streamOptions} inheritLabel="Same as you" onChange={(streamUrl) => onChange({ streamUrl })} />
+            ) : (
             <Input
               className="h-8 text-xs"
               placeholder="Same as you"
               value={user?.streamUrl ?? ''}
               onChange={(e) => onChange({ streamUrl: e.target.value.trim() ? e.target.value : undefined })}
             />
+            )}
             <p className="text-[11px] text-muted-foreground">
               An address this user plays from instead of the one above, so a user can be pointed at a different addon. Empty follows yours.
             </p>
@@ -352,14 +359,18 @@ interface JellyfinDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   userUUID: string;
+  /** Jellyfin admin (fork): the alias the server address uses instead of the id. */
+  addressId?: string;
+  /** Jellyfin admin (fork): the dashboard's stream addon list, offered by name. */
+  streamOptions?: StreamOption[];
 }
 
-export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogProps) {
+export function JellyfinDialog({ open, onOpenChange, userUUID, addressId, streamOptions }: JellyfinDialogProps) {
   const { config, setConfig, auth } = useConfig();
   const { requestSave, isSaving, isDirty, canSave } = useSave();
   const [resolveMode, setResolveMode] = useState<string>('user');
   const [baseUrl, setBaseUrl] = useState<string>(window.location.origin);
-  const serverAddress = `${baseUrl.replace(/\/+$/, '')}/jellyfin/${userUUID}`;
+  const serverAddress = `${baseUrl.replace(/\/+$/, '')}/jellyfin/${addressId || userUUID}`;
   useEffect(() => {
     let cancelled = false;
     fetch('/api/config')
@@ -473,7 +484,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
     try {
       const response = await fetch(`/api/jellyfin/${encodeURIComponent(userUUID)}/quick-connect/approve`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...adminAuthHeaders() },
         body: JSON.stringify({ code, password: auth.password || undefined, profile: quickConnectProfile || undefined }),
       });
       const result = await response.json().catch(() => null);
@@ -495,7 +506,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
     try {
       const response = await fetch(`/api/jellyfin/${encodeURIComponent(userUUID)}/forget-imported`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...adminAuthHeaders() },
         body: JSON.stringify({ password: auth.password || undefined, profile: forgetFor.profile || undefined }),
       });
       const result = await response.json().catch(() => null);
@@ -665,6 +676,13 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                   {config.jellyfinStreamUrl ? 'Stream addon set' : 'Browse only'}
                 </span>
               </div>
+              {streamOptions ? (
+                <StreamPicker
+                  value={config.jellyfinStreamUrl}
+                  options={streamOptions}
+                  onChange={(url) => setConfig(prev => ({ ...prev, jellyfinStreamUrl: url ?? '' }))}
+                />
+              ) : (
               <Input
                 id="jellyfin-stream-url"
                 value={config.jellyfinStreamUrl ?? ''}
@@ -672,6 +690,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                 className="font-mono text-xs"
                 onChange={(e) => setConfig(prev => ({ ...prev, jellyfinStreamUrl: e.target.value }))}
               />
+              )}
               <p className="text-xs text-muted-foreground">
                 Paste a stream addon's install URL, such as your AIOStreams. Without one, titles browse but will not play. AIOMetadata never serves the video itself; the client fetches it from that addon directly.
               </p>
@@ -756,6 +775,7 @@ export function JellyfinDialog({ open, onOpenChange, userUUID }: JellyfinDialogP
                   watchlistOptions={holder ? watchlistOptionsFor(user) : watchlistOptions}
                   hasPmdb={Boolean(config.apiKeys?.publicmetadb)}
                   showHandoff={config.playbackReporting === true}
+                  streamOptions={streamOptions}
                   onChange={(patch) => updateUser(user.id, patch)}
                   onRemove={() => { void removeUser(user); }}
                   onForget={() => setForgetFor({ profile: user.id, name: user.name })}

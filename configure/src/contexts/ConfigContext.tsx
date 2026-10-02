@@ -53,7 +53,8 @@ interface ConfigContextType {
   markManifestInstalled: () => void;
 }
 
-const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
+// Exported for the Jellyfin admin (fork), which edits another configuration inside the dashboard.
+export const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
 
 const CONFIG_STORAGE_KEY = 'stremio-addon-config';
 

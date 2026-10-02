@@ -3188,7 +3188,8 @@ export function register(addon: any, options: { loginRateLimit?: any; enabled?: 
     const password = req.body?.password;
 
     const accountId = req.session?.accountId;
-    const owns = Boolean(accountId) && (await database.ownsConfig(accountId, userUUID));
+    // Jellyfin admin (fork): the dashboard admin counts as an owner.
+    const owns = require('../jellyfinAdmin/adminAuth').isDashboardAdmin(req) || (Boolean(accountId) && (await database.ownsConfig(accountId, userUUID)));
     const verified = !owns && password ? await database.verifyUserAndGetConfig(userUUID, String(password)) : null;
     if (!owns && !verified) {
       res.status(401).json({ error: 'Sign in or enter the configuration password to approve a device' });
@@ -3211,7 +3212,8 @@ export function register(addon: any, options: { loginRateLimit?: any; enabled?: 
     const password = req.body?.password;
 
     const accountId = req.session?.accountId;
-    const owns = Boolean(accountId) && (await database.ownsConfig(accountId, userUUID));
+    // Jellyfin admin (fork): the dashboard admin counts as an owner.
+    const owns = require('../jellyfinAdmin/adminAuth').isDashboardAdmin(req) || (Boolean(accountId) && (await database.ownsConfig(accountId, userUUID)));
     const verified = !owns && password ? await database.verifyUserAndGetConfig(userUUID, String(password)) : null;
     if (!owns && !verified) {
       res.status(401).json({ error: 'Sign in or enter the configuration password to forget imported history' });

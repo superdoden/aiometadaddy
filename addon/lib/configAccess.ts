@@ -23,6 +23,12 @@ export async function resolveConfigAccess(
 ): Promise<ConfigAccess | null> {
   if (!userUUID) return null;
 
+  // Jellyfin admin (fork): the dashboard admin manages every configuration.
+  if (require('./jellyfinAdmin/adminAuth').isDashboardAdmin(req)) {
+    const config = await database.getUserConfig(userUUID);
+    if (config) return { config, passwordHash: await storedHash(userUUID) };
+  }
+
   const accountId = req?.session?.accountId;
   if (accountId && await database.ownsConfig(accountId, userUUID)) {
     const config = await database.getUserConfig(userUUID);

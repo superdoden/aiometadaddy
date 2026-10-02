@@ -823,6 +823,9 @@ class Database {
 
     await require('./configCache').del(userUUID).catch(() => undefined);
 
+    // Jellyfin admin (fork): a master hands its changes to its subs; not awaited.
+    require('./jellyfinAdmin/sync').afterConfigSaved(userUUID).catch((error: any) => logger.warn(`Jellyfin admin sync for ${userUUID} failed: ${error.message}`));
+
     // A replaced client password signs every client out.
     if (previousAppPassword && previousAppPassword !== newAppPassword) {
       await require('./jellyfin/tokens').revokeUserTokens(userUUID).catch((error: any) => logger.warn(`Signing out clients for ${userUUID} failed: ${error.message}`));

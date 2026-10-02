@@ -8196,6 +8196,9 @@ addon.get("/api/dashboard/jellyfin/:userUUID", requireDashboardAdmin, async (req
   }
 });
 
+// Jellyfin admin (fork): masters, subs, aliases and the stream addon list.
+require('./lib/jellyfinAdmin/routes').registerJellyfinAdminRoutes(addon, requireDashboardAdmin);
+
 addon.get("/api/dashboard/users", requireDashboardAdmin, (req, res) => {
   // Users endpoint is NOT disabled when metrics are disabled
   // It provides user management which is essential for admin UI

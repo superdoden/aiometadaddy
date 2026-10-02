@@ -37,7 +37,8 @@ interface SaveContextType {
   installUrl: string;
 }
 
-const SaveContext = createContext<SaveContextType | undefined>(undefined);
+// Exported for the Jellyfin admin (fork), which saves through its own route.
+export const SaveContext = createContext<SaveContextType | undefined>(undefined);
 
 /**
  * Key order is insertion order, so a config rebuilt by a section's setConfig can

@@ -40,6 +40,11 @@ const LazyUserManagementModal = lazy(() =>
   import("../UserManagementModal").then((module) => ({ default: module.UserManagementModal }))
 );
 
+// Jellyfin admin (fork)
+const LazyJellyfinAdminDialog = lazy(() =>
+  import("./jellyfinAdmin/JellyfinAdminDialog").then((module) => ({ default: module.JellyfinAdminDialog }))
+);
+
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const HOUR_LABELS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
 
@@ -160,7 +165,7 @@ function ActivityHeatmap({ data, days, onDaysChange }: { data: HeatmapData | und
 }
 
 export function DashboardUsers({ data, loading, activeTab }: { data: any; loading: boolean; activeTab: DashboardTab }) {
-  const { isAdmin, adminKey } = useAdmin();
+  const { isAdmin, adminKey, jellyfinEnabled } = useAdmin();
   const [heatmapDays, setHeatmapDays] = useState(7);
   const heatmapQuery = useDashboardHeatmap({ activeTab, days: heatmapDays });
 
@@ -183,6 +188,7 @@ export function DashboardUsers({ data, loading, activeTab }: { data: any; loadin
 
   const [error, setError] = useState(null);
   const [showUserManagement, setShowUserManagement] = useState(false);
+  const [showJellyfinAdmin, setShowJellyfinAdmin] = useState(false);
   const [selectedUser, setSelectedUser] = useState<any>(null);
   const [showUserDetails, setShowUserDetails] = useState(false);
 
@@ -496,6 +502,16 @@ export function DashboardUsers({ data, loading, activeTab }: { data: any; loadin
                 <Users className="h-4 w-4 mr-2" />
                 Manage Users
               </Button>
+              {jellyfinEnabled ? (
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => setShowJellyfinAdmin(true)}
+                >
+                  <img src="/jellyfin_icon.svg" alt="" aria-hidden="true" className="h-4 w-4 mr-2 object-contain" />
+                  Jellyfin Users
+                </Button>
+              ) : null}
               {/* Placeholder buttons - hidden for now
               <Button variant="outline" className="w-full">
                 <Shield className="h-4 w-4 mr-2" />
@@ -645,6 +661,12 @@ export function DashboardUsers({ data, loading, activeTab }: { data: any; loadin
             onClose={() => setShowUserManagement(false)}
             adminKey={adminKey}
           />
+        </Suspense>
+      ) : null}
+
+      {showJellyfinAdmin ? (
+        <Suspense fallback={null}>
+          <LazyJellyfinAdminDialog isOpen={showJellyfinAdmin} onClose={() => setShowJellyfinAdmin(false)} />
         </Suspense>
       ) : null}
     </div>

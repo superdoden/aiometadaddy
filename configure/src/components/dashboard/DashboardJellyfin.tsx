@@ -14,6 +14,7 @@ import {
   type JellyfinPlayRow,
   type JellyfinSessionRow,
 } from "@/hooks/useDashboardQueries";
+import { JellyfinConfigsCard } from "./jellyfinAdmin/JellyfinConfigsCard";
 
 function when(value: number | null | undefined): string {
   if (!value) return "—";
@@ -485,6 +486,9 @@ export default function DashboardJellyfin({ activeTab }: { activeTab: DashboardT
         <Stat label="Plays, 24 h" value={o?.playedDay ?? "…"} hint={o ? `${o.playedWeek} this week` : undefined} />
         <Stat label="Tracker sync" value={sync ? (sync.running ? "…" : sync.finishedAt ? when(sync.finishedAt) : "—") : "…"} hint={syncHint || undefined} />
       </div>
+
+      {/* Jellyfin admin (fork) */}
+      <JellyfinConfigsCard onPick={pick} />
 
       <Card>
         <CardHeader className="space-y-3">
