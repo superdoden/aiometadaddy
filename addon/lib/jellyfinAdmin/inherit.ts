@@ -21,8 +21,24 @@ const TRACKERS: TrackerSlot[] = [
   { service: 'trakt', key: 'traktTokenId', flag: 'traktWatchTracking', extras: ['traktUser'] },
 ];
 
-/** Bookkeeping a sub always keeps as its own. */
-const OWN_FIELDS = new Set(['configVersion', 'lastModified', 'configHash', 'sessionId']);
+/**
+ * Bookkeeping a sub always keeps as its own, and the AIOManager/Hydra accounts,
+ * which would otherwise let a sub push its install into the master's manager.
+ */
+const OWN_FIELDS = new Set(['configVersion', 'lastModified', 'configHash', 'sessionId', 'managers', 'managerAccounts']);
+
+/** Marks a credential in the inherited map as the sub's own, even when the master holds the same one. */
+const OWN_PREFIX = 'own:';
+
+/** Every tracker credential a configuration holds, marked as its own; for adopting a configuration as a sub. */
+export function ownMarkersFor(config: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const slot of TRACKERS) {
+    const cred = config?.apiKeys?.[slot.key];
+    if (cred) out[`${OWN_PREFIX}${slot.key}`] = cred;
+  }
+  return out;
+}
 
 function isOwnField(key: string): boolean {
   return key.startsWith('jellyfin') || OWN_FIELDS.has(key);
@@ -34,7 +50,7 @@ function catalogKey(catalog: any): string {
 
 export interface BuiltSub {
   config: any;
-  /** Credentials taken from the master this time, by apiKeys key. */
+  /** Credentials taken from the master this time, by apiKeys key, plus `own:` markers for the sub's own. */
   inherited: Record<string, string>;
 }
 
@@ -64,9 +80,12 @@ export function buildSubConfig(master: any, sub: any | null, previouslyInherited
   for (const slot of TRACKERS) {
     const masterCred = masterKeys[slot.key] || undefined;
     const subCred = subKeys[slot.key] || undefined;
-    const own = Boolean(subCred) && subCred !== previouslyInherited[slot.key] && subCred !== masterCred;
+    const markedOwn = Boolean(subCred) && subCred === previouslyInherited[`${OWN_PREFIX}${slot.key}`];
+    const own = markedOwn || (Boolean(subCred) && subCred !== previouslyInherited[slot.key] && subCred !== masterCred);
 
     if (own) {
+      // Remembered, so it stays the sub's if the master later connects the same account.
+      inherited[`${OWN_PREFIX}${slot.key}`] = subCred as string;
       out.apiKeys[slot.key] = subCred;
       out[slot.flag] = sub[slot.flag];
       out.watchTracking[slot.service] = sub?.watchTracking?.[slot.service];

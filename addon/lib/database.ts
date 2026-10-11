@@ -1012,6 +1012,8 @@ class Database {
   }
 
   async deleteUser(userUUID: string): Promise<boolean> {
+    // Jellyfin admin (fork): a master with subs stays; refused before anything is removed.
+    await require('./jellyfinAdmin/store').assertDeletable(userUUID);
     try {
       const query = this.type === 'sqlite'
         ? 'DELETE FROM user_configs WHERE user_uuid = ?'
@@ -1030,6 +1032,7 @@ class Database {
         : 'DELETE FROM user_aliases WHERE user_uuid = $1';
       await this.runAliasCleanup(deleteAliasQuery, [userUUID]);
       await this.unlinkConfigFromAllAccounts(userUUID);
+      await require('./jellyfinAdmin/store').forgetConfig(userUUID).catch((error: any) => logger.warn(`Jellyfin admin cleanup for ${userUUID} failed: ${error.message}`));
 
       // After the row is gone: clearing first lets a concurrent read cache it again.
       await require('./configCache').del(userUUID).catch(() => undefined);
@@ -2182,9 +2185,11 @@ class Database {
       const cutoffDate = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000);
       const cutoffDateStr = cutoffDate.toISOString();
 
+      // Jellyfin admin (fork): masters and subs are never inactive users.
+      await require('./jellyfinAdmin/store').ensureTables();
       const query = this.type === 'sqlite'
-        ? 'DELETE FROM user_configs WHERE updated_at < ?'
-        : 'DELETE FROM user_configs WHERE updated_at < $1';
+        ? 'DELETE FROM user_configs WHERE updated_at < ? AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)'
+        : 'DELETE FROM user_configs WHERE updated_at < $1 AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)';
 
       const result = await this.runQuery(query, [cutoffDateStr]);
 

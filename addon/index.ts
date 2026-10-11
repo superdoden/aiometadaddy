@@ -6886,6 +6886,8 @@ addon.delete('/api/admin/users/:userUUID', requireDashboardAdmin, async (req, re
     res.json({ success: true, message: 'User deleted successfully' });
   } catch (error) {
     consola.error('[Admin API] Error deleting user:', error);
+    // Jellyfin admin (fork): a refused master delete says why.
+    if (error?.status === 409) return res.status(409).json({ error: error.message });
     res.status(500).json({ error: 'Failed to delete user' });
   }
 });

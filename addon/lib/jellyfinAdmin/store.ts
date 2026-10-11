@@ -140,6 +140,38 @@ export async function deleteManaged(uuid: string): Promise<void> {
   (await loadManaged()).delete(uuid);
 }
 
+/** A master keeps its configuration while any sub is built from it, wherever the delete comes from. */
+export async function assertDeletable(uuid: string): Promise<void> {
+  const entry = await getManaged(uuid);
+  if (entry?.kind !== 'master') return;
+  const subs = await subsOf(uuid);
+  if (subs.length) {
+    throw Object.assign(
+      new Error(`"${entry.name}" is a Jellyfin master with ${subs.length} sub${subs.length === 1 ? '' : 's'}; move or delete them first`),
+      { status: 409 }
+    );
+  }
+}
+
+/** Called once a configuration is gone, so no managed entry points at nothing. */
+export async function forgetConfig(uuid: string): Promise<void> {
+  if (await getManaged(uuid)) await deleteManaged(uuid);
+}
+
+/**
+ * Entries whose configuration was deleted before deletes cleaned up after
+ * themselves: dropped, and a sub whose master is gone becomes an ordinary
+ * configuration again so it shows up to be attached elsewhere.
+ */
+export async function pruneManaged(existing: Set<string>): Promise<void> {
+  for (const entry of await listManaged()) {
+    if (!existing.has(entry.uuid)) await deleteManaged(entry.uuid);
+  }
+  for (const entry of await listManaged()) {
+    if (entry.kind === 'sub' && (!entry.masterUuid || !existing.has(entry.masterUuid))) await deleteManaged(entry.uuid);
+  }
+}
+
 // --- Stream addon list ---
 
 function toStream(row: any): StreamEntry {
@@ -180,6 +212,10 @@ export async function updateStream(id: string, name: string, url: string): Promi
     sql('UPDATE jfa_stream_urls SET name = ?, url = ?, updated_at = ? WHERE id = ?'),
     [name, url, Date.now(), id]
   );
+}
+
+export async function deleteStreams(ids: string[]): Promise<void> {
+  for (const id of ids) await deleteStream(id);
 }
 
 export async function deleteStream(id: string): Promise<void> {

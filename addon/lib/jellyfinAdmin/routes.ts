@@ -1,6 +1,6 @@
 import consola from 'consola';
-import { allConfigs, deleteJellyfinState, deleteManaged, getManaged, listManaged, subsOf, upsertManaged } from './store';
-import { buildSubConfig } from './inherit';
+import { allConfigs, deleteJellyfinState, deleteManaged, getManaged, listManaged, pruneManaged, subsOf, upsertManaged } from './store';
+import { buildSubConfig, ownMarkersFor } from './inherit';
 import { applyToSub, lastSyncReport, syncMaster, writeConfig } from './sync';
 import { createStream, editStream, isStreamUrl, removeStream, streamsWithUsage } from './streams';
 
@@ -91,7 +91,12 @@ async function claimAlias(uuid: string, wanted: string): Promise<string> {
     const candidate = n === 1 ? wanted : `${wanted.slice(0, 29)}-${n}`;
     const owner = aliases.resolveAliasSync(candidate.toLowerCase());
     if (owner && owner !== uuid) continue;
-    return setAlias(uuid, candidate);
+    try {
+      return await setAlias(uuid, candidate);
+    } catch (error: any) {
+      // The map can be up to half a minute behind; taken after all means try the next one.
+      if (error?.status !== 409) throw error;
+    }
   }
   throw Object.assign(new Error('No free alias found for that name'), { status: 409 });
 }
@@ -108,12 +113,18 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
   };
 
   route('get', '/overview', async (req, res) => {
-    const [configs, managed, seen] = await Promise.all([allConfigs(), listManaged(), activity()]);
+    const [configs, seen] = await Promise.all([allConfigs(), activity()]);
+    await pruneManaged(new Set(configs.map((c) => c.uuid)));
+    const managed = await listManaged();
     const managedBy = new Map(managed.map((m) => [m.uuid, m]));
-    const streams: Array<{ url: string; name: string }> = await streamsWithUsage().catch(() => []);
-    const streamName = new Map<string, string>(streams.map((s) => [s.url, s.name]));
+    const streams = await streamsWithUsage(configs).catch((error) => {
+      logger.warn(`Stream list unavailable: ${error.message}`);
+      return [];
+    });
+    const streamName = new Map<string, string>(streams.map((s): [string, string] => [s.url, s.name]));
 
     res.json({
+      streams,
       jellyfinEnabled: String(getSetting('JELLYFIN_API_ENABLED') || '').trim().toLowerCase() === 'true',
       aliasesEnabled: aliases.isAliasFeatureEnabled(),
       baseUrl: require('../installUrl').baseUrlFrom(process.env.HOST_NAME, req.get('host')),
@@ -247,7 +258,10 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
     if (current?.kind === 'master') throw Object.assign(new Error('A master cannot become a sub'), { status: 409 });
     const config = await requireConfig(uuid);
     const name = cleanName(req.body?.name) || current?.name || config.jellyfinUserName || config.addonName || uuid.slice(0, 8);
-    const entry = await upsertManaged({ uuid, kind: 'sub', name, masterUuid, inherited: current?.inherited ?? {} });
+    // A configuration adopted from outside keeps every tracker account it had as its own,
+    // even one the master shares; a sub that moves keeps what it borrowed and owned.
+    const inherited = current?.inherited ?? ownMarkersFor(config);
+    const entry = await upsertManaged({ uuid, kind: 'sub', name, masterUuid, inherited });
     const result = await applyToSub(entry, await requireConfig(masterUuid));
     res.json({ entry, result });
   }, 'Failed to assign');
@@ -285,6 +299,8 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
   route('put', '/alias/:uuid', async (req, res) => {
     const uuid = String(req.params.uuid);
     await requireConfig(uuid);
+    // Agreed: only subs get an alias, since an alias makes the install address guessable.
+    if ((await getManaged(uuid))?.kind !== 'sub') throw Object.assign(new Error('Only subs get an alias'), { status: 400 });
     res.json({ alias: await setAlias(uuid, String(req.body?.alias ?? '')) });
   }, 'Failed to set the alias');
 

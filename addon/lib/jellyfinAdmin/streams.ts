@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
 import consola from 'consola';
-import { allConfigs, deleteStream, getMeta, getStream, insertStream, listStreams, setMeta, updateStream, type StreamEntry } from './store';
+import { allConfigs, deleteStream, deleteStreams, getMeta, getStream, insertStream, listStreams, setMeta, updateStream, type StreamEntry } from './store';
 import { writeConfig } from './sync';
 
 const logger = consola.withTag('JellyfinAdmin');
@@ -41,35 +41,66 @@ function newId(): string {
   return randomBytes(8).toString('hex');
 }
 
-/** Once: every address already in a configuration becomes an entry. */
-async function importExisting(): Promise<void> {
-  if (await getMeta('streams_imported')) return;
-  const known = new Set((await listStreams()).map((s) => s.url));
-  let n = known.size;
-  for (const { config } of await allConfigs()) {
-    for (const url of streamUrlsOf(config)) {
-      if (known.has(url)) continue;
-      known.add(url);
-      n += 1;
-      await insertStream(newId(), `AIOStreams ${n}`, url);
-    }
+type Configs = Array<{ config: any }>;
+
+let importing: Promise<void> | null = null;
+
+/** Once: every address already in a configuration becomes an entry. Concurrent callers share one run. */
+function importExisting(configs?: Configs): Promise<void> {
+  if (!importing) {
+    importing = (async () => {
+      if (await getMeta('streams_imported')) return;
+      const known = new Set((await listStreams()).map((s) => s.url));
+      let n = known.size;
+      for (const { config } of configs ?? await allConfigs()) {
+        for (const url of streamUrlsOf(config)) {
+          if (known.has(url)) continue;
+          known.add(url);
+          n += 1;
+          await insertStream(newId(), `AIOStreams ${n}`, url);
+        }
+      }
+      await setMeta('streams_imported', String(Date.now()));
+      logger.info(`Stream list started with ${n} addresses from existing configurations`);
+    })().catch((error) => {
+      importing = null;
+      throw error;
+    });
   }
-  await setMeta('streams_imported', String(Date.now()));
-  logger.info(`Stream list started with ${n} addresses from existing configurations`);
+  return importing;
 }
 
-export async function streamsWithUsage(): Promise<Array<StreamEntry & { usage: number }>> {
-  await importExisting();
+/** One entry per address; extra copies (from an import that once ran twice) are removed, oldest kept. */
+async function uniqueStreams(): Promise<StreamEntry[]> {
+  const all = (await listStreams()).sort((a, b) => a.createdAt - b.createdAt);
+  const seen = new Set<string>();
+  const extra: string[] = [];
+  const kept = all.filter((s) => {
+    if (seen.has(s.url)) {
+      extra.push(s.id);
+      return false;
+    }
+    seen.add(s.url);
+    return true;
+  });
+  if (extra.length) await deleteStreams(extra);
+  return kept.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Pass the configurations when they are already loaded, to read the table once. */
+export async function streamsWithUsage(configs?: Configs): Promise<Array<StreamEntry & { usage: number }>> {
+  const loaded = configs ?? await allConfigs();
+  await importExisting(loaded);
   const counts = new Map<string, number>();
-  for (const { config } of await allConfigs()) {
+  for (const { config } of loaded) {
     for (const url of streamUrlsOf(config)) counts.set(url, (counts.get(url) ?? 0) + 1);
   }
-  return (await listStreams()).map((s) => ({ ...s, usage: counts.get(s.url) ?? 0 }));
+  return (await uniqueStreams()).map((s) => ({ ...s, usage: counts.get(s.url) ?? 0 }));
 }
 
 export async function createStream(name: string, url: string): Promise<StreamEntry> {
   await importExisting();
-  if ((await listStreams()).some((s) => s.url === url)) throw Object.assign(new Error('That address is already in the list'), { status: 409 });
+  if ((await uniqueStreams()).some((s) => s.url === url)) throw Object.assign(new Error('That address is already in the list'), { status: 409 });
   return insertStream(newId(), name, url);
 }
 

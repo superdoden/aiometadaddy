@@ -58,6 +58,7 @@ export interface Overview {
   baseUrl: string;
   configs: OverviewConfig[];
   lastSync: Record<string, SyncReport | null>;
+  streams: StreamEntry[];
 }
 
 export interface StreamEntry {

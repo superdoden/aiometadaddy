@@ -366,6 +366,41 @@ function MastersTab({ api, overview, streams, onChanged, onEdit, presetSource, c
     }
   };
 
+  const otherMasters = masters.filter((m) => m.uuid !== selected);
+  const [moving, setMoving] = useState(false);
+
+  /** Re-attaches subs to another master; their users, passwords, alias and own accounts stay. */
+  const move = async (list: OverviewConfig[], targetUuid: string) => {
+    const target = masters.find((m) => m.uuid === targetUuid);
+    if (!target || !list.length) return;
+    const what = list.length === 1 ? `"${labelOf(list[0])}"` : `all ${list.length} subs`;
+    if (!window.confirm(`Move ${what} to "${labelOf(target)}"? Catalogs and settings then come from "${labelOf(target)}"; Jellyfin users, passwords, alias and own tracker accounts stay.`)) return;
+    setMoving(true);
+    let moved = 0;
+    try {
+      for (const sub of list) {
+        await api.assign(sub.uuid, targetUuid);
+        moved += 1;
+      }
+      toast.success(`${moved} sub${moved === 1 ? "" : "s"} moved to "${labelOf(target)}"`);
+    } catch (e) {
+      toast.error(`${moved} of ${list.length} moved: ${errorText(e, "move failed")}`);
+    } finally {
+      setMoving(false);
+      onChanged();
+    }
+  };
+
+  const moveSelect = (list: OverviewConfig[], label: string) =>
+    otherMasters.length ? (
+      <Select value="" onValueChange={(v) => void move(list, v)} disabled={moving}>
+        <SelectTrigger className="h-7 w-auto gap-1 px-2 text-xs"><SelectValue placeholder={label} /></SelectTrigger>
+        <SelectContent>
+          {otherMasters.map((m) => <SelectItem key={m.uuid} value={m.uuid}>{labelOf(m)}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    ) : null;
+
   const remove = async (c: OverviewConfig) => {
     const what = c.kind === "master" ? "master" : "sub";
     if (!window.confirm(`Delete the ${what} "${labelOf(c)}"? Its configuration${c.kind === "sub" ? ", Jellyfin users, sign-ins and watch state" : ""} are deleted for good.`)) return;
@@ -438,6 +473,7 @@ function MastersTab({ api, overview, streams, onChanged, onEdit, presetSource, c
                   {syncing ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1 h-3 w-3" />}Update subs now
                 </Button>
                 <PasswordReset api={api} uuid={master.uuid} />
+                {subs.length ? moveSelect(subs, "Move all subs to…") : null}
                 <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-destructive" disabled={subs.length > 0} title={subs.length ? "Delete or move its subs first" : undefined} onClick={() => void remove(master)}>
                   <Trash2 className="mr-1 h-3 w-3" />Delete master
                 </Button>
@@ -479,9 +515,12 @@ function MastersTab({ api, overview, streams, onChanged, onEdit, presetSource, c
                 onEdit={onEdit}
                 onChanged={onChanged}
                 actions={
-                  <Button variant="ghost" size="sm" className="ml-auto h-7 px-2 text-xs text-destructive" onClick={() => void remove(c)}>
-                    <Trash2 className="mr-1 h-3 w-3" />Delete
-                  </Button>
+                  <>
+                    {moveSelect([c], "Move to master…")}
+                    <Button variant="ghost" size="sm" className="ml-auto h-7 px-2 text-xs text-destructive" onClick={() => void remove(c)}>
+                      <Trash2 className="mr-1 h-3 w-3" />Delete
+                    </Button>
+                  </>
                 }
               />
             ))}
@@ -502,7 +541,7 @@ function OthersTab({ api, overview, onChanged, onEdit, onUseAsMaster }: { api: J
 
   const assign = async (c: OverviewConfig, masterUuid: string) => {
     const master = masters.find((m) => m.uuid === masterUuid);
-    if (!window.confirm(`Make "${labelOf(c)}" a sub of "${master ? labelOf(master) : "the master"}"? Its catalogs and settings are replaced by the master's; its Jellyfin users, passwords and own tracker accounts stay.`)) return;
+    if (!window.confirm(`Make "${labelOf(c)}" a sub of "${master ? labelOf(master) : "the master"}"? Its catalogs and settings are replaced by the master's; its Jellyfin users, passwords and tracker accounts stay its own.`)) return;
     try {
       await api.assign(c.uuid, masterUuid);
       toast.success(`"${labelOf(c)}" is now a sub`);
@@ -649,9 +688,10 @@ export function JellyfinAdminDialog({ isOpen, onClose }: { isOpen: boolean; onCl
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [o, s] = await Promise.all([api.overview(), api.streams()]);
+      // One request: the overview carries the stream list, so the server reads every configuration once.
+      const o = await api.overview();
       setOverview(o);
-      setStreams(s.streams);
+      setStreams(o.streams ?? []);
     } catch (e) {
       toast.error(errorText(e, "Could not load the Jellyfin configurations"));
     } finally {
