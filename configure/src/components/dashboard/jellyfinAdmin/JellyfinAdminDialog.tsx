@@ -428,11 +428,11 @@ function MastersTab({ api, overview, streams, onChanged, onEdit, presetSource, c
                 <Button variant="ghost" size="sm" className="h-6 w-6 p-0" aria-label="Copy id" onClick={() => void copy(master.uuid, "Configuration id")}><Copy className="h-3 w-3" /></Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                Catalogs, providers and keys are edited on the configuration page: open it, load this id with the master's password, and save. Every save reaches all subs. Tracker accounts of the master serve the subs' catalogs only; nothing a sub plays is read from or written to them.
+                Catalogs, providers and keys are edited on the configuration page: open it, enter the master's password, and save. Every save reaches all subs. Tracker accounts of the master serve the subs' catalogs only; nothing a sub plays is read from or written to them.
               </p>
               <div className="flex flex-wrap items-center gap-1">
                 <Button asChild variant="outline" size="sm" className="h-7 px-2 text-xs">
-                  <a href={`/configure`} target="_blank" rel="noreferrer"><ExternalLink className="mr-1 h-3 w-3" />Configuration page</a>
+                  <a href={`/stremio/${encodeURIComponent(master.uuid)}/configure`} target="_blank" rel="noreferrer"><ExternalLink className="mr-1 h-3 w-3" />Configuration page</a>
                 </Button>
                 <Button variant="outline" size="sm" className="h-7 px-2 text-xs" disabled={syncing} onClick={() => void sync()}>
                   {syncing ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1 h-3 w-3" />}Update subs now
