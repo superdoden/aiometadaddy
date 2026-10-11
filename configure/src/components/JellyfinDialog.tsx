@@ -370,7 +370,8 @@ export function JellyfinDialog({ open, onOpenChange, userUUID, addressId, stream
   const { requestSave, isSaving, isDirty, canSave } = useSave();
   const [resolveMode, setResolveMode] = useState<string>('user');
   const [baseUrl, setBaseUrl] = useState<string>(window.location.origin);
-  const serverAddress = `${baseUrl.replace(/\/+$/, '')}/jellyfin/${addressId || userUUID}`;
+  // Jellyfin admin (fork): the short /j/ address, easier to type on a TV; /jellyfin/ still works.
+  const serverAddress = `${baseUrl.replace(/\/+$/, '')}/j/${addressId || userUUID}`;
   useEffect(() => {
     let cancelled = false;
     fetch('/api/config')

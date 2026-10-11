@@ -6,7 +6,15 @@ import { readToken } from './tokens';
 const logger = consola.withTag('Jellyfin');
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const PATH = /^\/jellyfin\/([^/?]+)(?:\/emby)?\/socket(?:\?|$)/i;
+// Jellyfin admin (fork): also under the short /j/ address.
+const PATH = /^\/(?:jellyfin|j)\/([^/?]+)(?:\/emby)?\/socket(?:\?|$)/i;
+
+/** The upgrade skips the HTTP middleware, so an alias in the address is resolved here. */
+function configIdOf(segment: string): string {
+  const { isAliasFeatureEnabled, resolveAliasSync } = require('../aliasResolver');
+  if (!isAliasFeatureEnabled()) return segment;
+  return resolveAliasSync(segment.toLowerCase()) ?? segment;
+}
 
 function accept(key: string): string {
   return createHash('sha1').update(key + GUID).digest('base64');
@@ -96,7 +104,7 @@ export function attachJellyfinSocket(server: any): void {
       return;
     }
 
-    if (!userUUID || userUUID !== decodeURIComponent(match[1])) {
+    if (!userUUID || userUUID !== configIdOf(decodeURIComponent(match[1]))) {
       reject(socket, 401, 'Unauthorized');
       return;
     }

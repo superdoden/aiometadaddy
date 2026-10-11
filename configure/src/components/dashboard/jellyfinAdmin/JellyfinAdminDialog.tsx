@@ -281,7 +281,7 @@ function PasswordReset({ api, uuid }: { api: JellyfinAdminApi; uuid: string }) {
 }
 
 function ConfigRow({ api, config, overview, onEdit, onChanged, actions }: { api: JellyfinAdminApi; config: OverviewConfig; overview: Overview; onEdit: (c: OverviewConfig) => void; onChanged: () => void; actions?: ReactNode }) {
-  const address = `${overview.baseUrl.replace(/\/+$/, "")}/jellyfin/${(overview.aliasesEnabled && config.alias) || config.uuid}`;
+  const address = `${overview.baseUrl.replace(/\/+$/, "")}/j/${(overview.aliasesEnabled && config.alias) || config.uuid}`;
   const isSub = config.kind === "sub";
   return (
     <div className="space-y-2 rounded-md border p-3">

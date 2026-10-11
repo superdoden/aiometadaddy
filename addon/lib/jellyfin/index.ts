@@ -3179,7 +3179,8 @@ export function register(addon: any, options: { loginRateLimit?: any; enabled?: 
     next();
   };
 
-  addon.use('/jellyfin/:userUUID', gate, createJellyfinRouter({ loginRateLimit: options.loginRateLimit }));
+  // Jellyfin admin (fork): /j/ is a shorter address for typing on a TV.
+  addon.use(['/jellyfin/:userUUID', '/j/:userUUID'], gate, createJellyfinRouter({ loginRateLimit: options.loginRateLimit }));
 
   // Approved from the configuration page, by session or configuration password.
   const approveRateLimit = options.loginRateLimit || ((_req: any, _res: any, next: any) => next());
