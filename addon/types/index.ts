@@ -5,6 +5,7 @@ export interface UserConfig {
   /** Install URL of a stream addon the Jellyfin server delegates playback to. */
   jellyfinStreamUrl?: string;
   jellyfinLatestRows?: boolean;
+  jellyfinMarkUnaired?: boolean;
   /** Playback is reported by the client, so the subtitle trigger is not used. */
   playbackReporting?: boolean;
   /** Password a Jellyfin client signs in with, for accounts that have no configuration password. */
@@ -16,9 +17,9 @@ export interface UserConfig {
   jellyfinUserAvatar?: string;
   jellyfinUserTags?: string[];
   jellyfinUserHandoffNames?: string[];
-  jellyfinSkipSource?: 'auto' | 'publicmetadb' | 'introdb' | 'off';
+  jellyfinSkipSource?: 'auto' | 'off' | 'publicmetadb' | 'aniskip' | 'introdb' | Array<'publicmetadb' | 'aniskip' | 'introdb'>;
   jellyfinWatchlistServices?: string[];
-  jellyfinUsers?: Array<{ id: string; name: string; avatar?: string; tags: string[]; trackers?: boolean; trackerSource?: string; skipSource?: string; watchlistServices?: string[]; handoffNames?: string[]; accounts?: any; streamUrl?: string }>;
+  jellyfinUsers?: Array<{ id: string; name: string; avatar?: string; tags: string[]; trackers?: boolean; trackerSource?: string; skipSource?: string | string[]; watchlistServices?: string[]; handoffNames?: string[]; accounts?: any; streamUrl?: string; pin?: string }>;
   /** Serve the collection layout's images through this instance's image cache. */
   collectionImagesViaCache?: boolean;
   providers?: {

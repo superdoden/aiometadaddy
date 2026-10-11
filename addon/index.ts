@@ -85,7 +85,7 @@ const { clientDistDir, clientIndexPath, publicDir } = require('./lib/runtimePath
 const ADDON_VERSION = buildInfo.version;
 const { withGlobalEpoch } = require('./lib/cacheEpoch');
 const idMapper = require('./lib/id-mapper');
-const wikiMappings = require('./lib/wiki-mapper.js');
+const idMappings = require('./lib/id-mappings.js');
 
 // Normalize redirect URIs to always include a scheme
 // Best-effort same-process duplicate handling. Trakt enforces authorization-code
@@ -4204,6 +4204,21 @@ addon.get("/api/publicmetadb/lists/:listId/items", async (req, res) => {
   }
 });
 
+addon.get("/api/publicmetadb/lists/u/:user/:slug/items", async (req, res) => {
+  try {
+    const { apikey, page, perPage } = req.query;
+    const { user, slug } = req.params;
+    if (!apikey) return res.status(400).json({ error: "apikey is required" });
+    const { fetchPublicListByLink } = require('./utils/publicmetadbUtils');
+    const data = await fetchPublicListByLink(apikey, user, slug, parseInt(page) || 1, parseInt(perPage) || 100);
+    res.json(data);
+  } catch (error) {
+    const status = Number(/returned (\d{3})/.exec(error.message || '')?.[1]) || 500;
+    if (status >= 500) consola.error("[PublicMetaDB Proxy] Public list error:", error.message);
+    res.status(status).json({ error: status === 404 ? 'No public PublicMetaDB list at that link' : error.message });
+  }
+});
+
 addon.get("/api/publicmetadb/picks", async (req, res) => {
   try {
     const { apikey } = req.query;
@@ -5390,16 +5405,12 @@ const catalogRoute = async function (req, res) {
             const allAnimeGenres = await cacheWrapJikanApi('anime-genres', async () => {
               return await jikan.getAnimeGenres();
             }, null);
-            const genreNameToFetch = genreName || allAnimeGenres[0]?.name;
-            if (genreNameToFetch) {
-              const selectedGenre = allAnimeGenres.find(g => g.name === genreNameToFetch);
-              if (selectedGenre) {
-                const genreId = selectedGenre.mal_id;
-                const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType || 'all'}-${page}-${config.sfw}`, async () => {
-                  return await jikan.getAnimeByGenre(genreId, mediaType, page, config);
-                }, null);
-                metas = await parseAnimeCatalogMetaBatch(animeResults, config, language);
-              }
+            const genreId = genreName === 'None' ? null : allAnimeGenres.find(g => g.name === (genreName || allAnimeGenres[0]?.name))?.mal_id;
+            if (genreId !== undefined) {
+              const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId ?? 'any'}-${mediaType || 'all'}-${page}-${config.sfw}`, async () => {
+                return await jikan.getAnimeByGenre(genreId, mediaType, page, config);
+              }, null);
+              metas = await parseAnimeCatalogMetaBatch(animeResults, config, language);
             }
             break;
           }
@@ -5514,11 +5525,14 @@ const catalogRoute = async function (req, res) {
     // Skip poster override for up next catalogs unless useShowPosterForUpNext is enabled
     // (when disabled, up next uses episode thumbnails as posters which shouldn't be overridden)
     const host = process.env.HOST_NAME.startsWith('http') ? process.env.HOST_NAME : `https://${process.env.HOST_NAME}`;
+    const upstreamArt = !config._currentSearchCatalogId && catalogConfig?.metadata?.useUpstreamArt === true;
     const posterPatternsEnabled = config._currentSearchCatalogId
       ? (config.search?.engineRatingPosters?.[config._currentSearchCatalogId] === true)
-      : (catalogConfig?.enableRatingPosters !== false);
+      : (catalogConfig?.enableRatingPosters !== false && !upstreamArt);
     const posterPattern = posterPatternsEnabled ? require('./utils/parseProps').resolvePosterPattern(config) : null;
-    if ((posterPattern || config.customBackgroundUrlPattern || config.customLandscapeUrlPattern || config.customLogoUrlPattern) && responseData?.metas && Array.isArray(responseData.metas)) {
+    const backgroundPattern = upstreamArt ? null : config.customBackgroundUrlPattern;
+    const logoPattern = upstreamArt ? null : config.customLogoUrlPattern;
+    if ((posterPattern || backgroundPattern || config.customLandscapeUrlPattern || logoPattern) && responseData?.metas && Array.isArray(responseData.metas)) {
       const isUpNextCatalog = cleanId.includes('up_next') || cleanId.includes('upnext');
       const upNextUsesShowPoster = isUpNextCatalog && catalogConfig?.metadata?.useShowPosterForUpNext === true;
       const { resolveCustomArtUrl, getPosterRatingApiKey, resolveLandscapePattern, posterShapeOf } = require('./utils/parseProps');
@@ -5548,8 +5562,8 @@ const catalogRoute = async function (req, res) {
             }
           }
         }
-        if (config.customBackgroundUrlPattern) {
-          const resolved = resolveCustomArtUrl(config.customBackgroundUrlPattern, ids, type, config, { shape: 'landscape' });
+        if (backgroundPattern) {
+          const resolved = resolveCustomArtUrl(backgroundPattern, ids, type, config, { shape: 'landscape' });
           if (resolved) {
             if (config.usePosterProxy) {
               const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
@@ -5578,8 +5592,8 @@ const catalogRoute = async function (req, res) {
             }
           }
         }
-        if (config.customLogoUrlPattern) {
-          const resolved = resolveCustomArtUrl(config.customLogoUrlPattern, ids, type, config);
+        if (logoPattern) {
+          const resolved = resolveCustomArtUrl(logoPattern, ids, type, config);
           if (resolved) {
             if (config.usePosterProxy) {
               const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
@@ -5606,7 +5620,7 @@ const catalogRoute = async function (req, res) {
     const isSearchCatalog = cleanId === 'search' || cleanId === 'people_search' || cleanId === 'gemini.search';
     if (catalogConfig?.metadata?.posterShape === 'landscape' && !isSearchCatalog && req.params.forJellyfin !== '1' && Array.isArray(responseData?.metas)) {
       for (const meta of responseData.metas) {
-        const landscape = meta.landscapePoster || meta.background;
+        const landscape = upstreamArt ? (meta.background || meta.landscapePoster) : (meta.landscapePoster || meta.background);
         if (meta.posterShape === 'landscape' || !landscape) continue;
         meta.poster = landscape;
         meta.posterShape = 'landscape';
@@ -6023,7 +6037,7 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
       if (allIds?.malId) {
         allIds.imdbId = idMapper.getTraktAnimeMovieByMalId(allIds.malId)?.externals.imdb;
         allIds.tmdbId = idMapper.getTraktAnimeMovieByMalId(allIds.malId)?.externals.tmdb || allIds.tmdbId;
-        allIds.tvdbId = (wikiMappings.getByImdbId(allIds.imdbId, 'movie'))?.tvdbId || null;
+        allIds.tvdbId = (idMappings.getByImdbId(allIds.imdbId, 'movie'))?.tvdbId || null;
       }
     }
 
@@ -8436,17 +8450,17 @@ addon.post("/api/dashboard/maintenance/execute", requireDashboardAdmin, async (r
           result = { success: false, message: `Failed to update Kitsu-IMDB Mapping: ${error.message}` };
         }
       }
-    } else if (taskId === 5) { // Update Wikidata Mappings
+    } else if (taskId === 5) { // Update ID Mappings
       if (action === 'restart' || action === 'enable') {
         try {
-          const { forceUpdateWikiMappings } = require('./lib/wiki-mapper');
-          result = await forceUpdateWikiMappings();
+          const { forceUpdateIdMappings } = require('./lib/id-mappings');
+          result = await forceUpdateIdMappings();
           if (result.success) {
-            result.message = `Wikidata Mappings updated successfully (${result.seriesCount.toLocaleString()} series, ${result.moviesCount.toLocaleString()} movies)`;
+            result.message = `ID Mappings updated successfully (${result.seriesCount.toLocaleString()} series, ${result.moviesCount.toLocaleString()} movies)`;
           }
         } catch (error) {
-          consola.error('[Maintenance Task] Error updating Wikidata Mappings:', error);
-          result = { success: false, message: `Failed to update Wikidata Mappings: ${error.message}` };
+          consola.error('[Maintenance Task] Error updating ID Mappings:', error);
+          result = { success: false, message: `Failed to update ID Mappings: ${error.message}` };
         }
       }
     } else if (taskId === 11) { // Update IMDb Ratings

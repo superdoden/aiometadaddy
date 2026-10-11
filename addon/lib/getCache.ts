@@ -1,5 +1,5 @@
 import { LRUCache } from 'lru-cache';
-import { withEpisodeOrder } from '../utils/episodeOrder';
+import { readsBySeason, withEpisodeOrder } from '../utils/episodeOrder';
 import type { MetaHashEntry } from './metaHashStore';
 const redis: any = require('./redisClient');
 const { loadConfigFromDatabase }: any = require('./configApi');
@@ -935,6 +935,7 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
         useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false,
       },
       ...(context.metaProvider === 'tvdb' ? { tvdbSeasonType: config.tvdbSeasonType || 'default' } : {}),
+      ...(context.metaProvider === 'tvdb' && readsBySeason(config.tvdbSeasonType) ? { episodeSource: 'seasons' } : {}),
     };
   } else if (type === 'movie') {
     context.metaProvider = config.providers?.movie || 'tmdb';
@@ -967,6 +968,7 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
     };
     context.videoOptions = {
       tvdbSeasonType: config.tvdbSeasonType || 'default',
+      ...(readsBySeason(config.tvdbSeasonType) ? { episodeSource: 'seasons' } : {}),
       forceAnimeForDetectedImdb: config.providers?.forceAnimeForDetectedImdb || false,
       ...(config.providers?.forceAnimeForDetectedImdb
         ? {
@@ -1112,11 +1114,14 @@ function buildMetaHashLayout({ config, metaId, type, useShowPoster = false }: { 
   return { key: `meta-h:${hashOf(legacyKeys.basic)}:${metaId}`, fields };
 }
 
-function getBlurProxyPrefix(): string {
-  const host = process.env.HOST_NAME?.startsWith('http')
+function publicHost(): string {
+  return process.env.HOST_NAME?.startsWith('http')
     ? process.env.HOST_NAME
     : `https://${process.env.HOST_NAME}`;
-  return `${host}/api/image/blur?url=`;
+}
+
+function getBlurProxyPrefix(): string {
+  return `${publicHost()}/api/image/blur?url=`;
 }
 
 function unwrapBlurThumbnail(thumbnail: string | null | undefined): string | null | undefined {
@@ -1138,8 +1143,9 @@ function applyBlurThumbProjection(meta: any, config: any): any {
   if (!meta?.videos || !Array.isArray(meta.videos)) return meta;
   const shouldBlur = !!config.blurThumbs;
   const blurPrefix = getBlurProxyPrefix();
+  const missingThumbnail = `${publicHost()}/missing_thumbnail.png`;
   meta.videos = meta.videos.map((video: any) => {
-    const rawThumbnail = unwrapBlurThumbnail(video.thumbnail);
+    const rawThumbnail = unwrapBlurThumbnail(video.thumbnail) || missingThumbnail;
     if (!shouldBlur || !rawThumbnail || rawThumbnail.endsWith('/missing_thumbnail.png')) {
       return { ...video, thumbnail: rawThumbnail };
     }
@@ -1526,6 +1532,10 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       order: pickOrder(config, idOnly),
       minVotes: voteFloor(config, idOnly),
     };
+  }
+
+  if (catalogFromConfig?.metadata?.useUpstreamArt === true) {
+    catalogConfig.upstreamArt = true;
   }
 
   const catalogConfigString = JSON.stringify(catalogConfig);
