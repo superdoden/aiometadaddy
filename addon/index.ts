@@ -7003,7 +7003,9 @@ addon.delete('/api/config/delete-user/:userUUID', async (req, res) => {
 
   } catch (error) {
     consola.error(`[Delete User] Error deleting user ${userUUID}:`, error);
-    res.status(500).json({ 
+    // Jellyfin admin (fork): a refused master delete says why.
+    if (error?.status === 409) return res.status(409).json({ error: error.message });
+    res.status(500).json({
       error: 'Failed to delete user account',
       details: error.message 
     });

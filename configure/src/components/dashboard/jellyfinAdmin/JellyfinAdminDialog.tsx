@@ -40,7 +40,7 @@ function labelOf(c: OverviewConfig): string {
 }
 
 function lastActivity(c: OverviewConfig): number | null {
-  const times = c.users.flatMap((u) => [u.lastSignIn ?? 0, u.lastPlay ?? 0]);
+  const times = c.users.flatMap((u) => [u.lastSeen ?? 0, u.lastPlay ?? 0]);
   const max = Math.max(0, ...times);
   return max || null;
 }
@@ -74,7 +74,7 @@ function UserChips({ config }: { config: OverviewConfig }) {
       {config.users.map((u) => (
         <span
           key={u.id || "main"}
-          title={`Last sign-in: ${when(u.lastSignIn)} · Last play: ${when(u.lastPlay)}`}
+          title={`Last seen: ${when(u.lastSeen)} · Last play: ${when(u.lastPlay)}`}
           className={cn("rounded-full border px-2 py-0.5 text-[11px]", u.main ? "border-primary/40 text-primary" : "border-white/10 text-muted-foreground")}
         >
           {u.name || "Unnamed"}

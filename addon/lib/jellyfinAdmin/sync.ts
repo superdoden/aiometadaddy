@@ -62,7 +62,20 @@ export async function applyToSub(entry: ManagedEntry, master: any): Promise<Sync
   }
 }
 
-export async function syncMaster(masterUuid: string): Promise<SyncReport> {
+/** One run per master at a time; a save during a run queues the next, which reads the newer master. */
+const runs = new Map<string, Promise<SyncReport>>();
+
+export function syncMaster(masterUuid: string): Promise<SyncReport> {
+  const previous = runs.get(masterUuid) ?? Promise.resolve(null);
+  const run = previous.catch(() => null).then(() => runSync(masterUuid));
+  runs.set(masterUuid, run);
+  void run.finally(() => {
+    if (runs.get(masterUuid) === run) runs.delete(masterUuid);
+  }).catch(() => undefined);
+  return run;
+}
+
+async function runSync(masterUuid: string): Promise<SyncReport> {
   const master = await database.getUserConfig(masterUuid);
   const results: SyncResult[] = [];
   if (master) {

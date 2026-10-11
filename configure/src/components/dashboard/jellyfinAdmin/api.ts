@@ -19,7 +19,7 @@ export interface OverviewUser {
   id: string;
   name: string;
   main?: boolean;
-  lastSignIn: number | null;
+  lastSeen: number | null;
   lastPlay: number | null;
 }
 

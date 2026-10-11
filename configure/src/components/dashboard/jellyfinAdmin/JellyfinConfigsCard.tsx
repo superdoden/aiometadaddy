@@ -102,7 +102,7 @@ export function JellyfinConfigsCard({ onPick }: { onPick: (uuid: string) => void
                         {c.users.map((u) => (
                           <div key={u.id || "main"} className="flex flex-wrap items-center gap-x-2">
                             <span className={cn(u.main && "text-primary")}>{u.name || "Unnamed"}</span>
-                            <span className="text-[11px] text-muted-foreground">signed in {when(u.lastSignIn)} · played {when(u.lastPlay)}</span>
+                            <span className="text-[11px] text-muted-foreground">seen {when(u.lastSeen)} · played {when(u.lastPlay)}</span>
                           </div>
                         ))}
                       </div>

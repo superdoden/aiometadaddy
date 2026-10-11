@@ -164,11 +164,14 @@ export async function forgetConfig(uuid: string): Promise<void> {
  * configuration again so it shows up to be attached elsewhere.
  */
 export async function pruneManaged(existing: Set<string>): Promise<void> {
+  // A read replica may not have a just-created configuration yet; young entries are left alone.
+  const settled = (entry: ManagedEntry) => Date.now() - entry.updatedAt > 10 * 60 * 1000;
   for (const entry of await listManaged()) {
-    if (!existing.has(entry.uuid)) await deleteManaged(entry.uuid);
+    if (settled(entry) && !existing.has(entry.uuid)) await deleteManaged(entry.uuid);
   }
+  const live = new Set((await listManaged()).map((e) => e.uuid));
   for (const entry of await listManaged()) {
-    if (entry.kind === 'sub' && (!entry.masterUuid || !existing.has(entry.masterUuid))) await deleteManaged(entry.uuid);
+    if (entry.kind === 'sub' && settled(entry) && (!entry.masterUuid || !live.has(entry.masterUuid))) await deleteManaged(entry.uuid);
   }
 }
 

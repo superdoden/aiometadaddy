@@ -53,16 +53,21 @@ function usersOf(config: any): Array<{ id: string; name: string; main?: boolean 
   return out;
 }
 
-/** Last sign-in and last play per configuration and user, from the tables the server keeps anyway. */
-async function activity(): Promise<Map<string, { signIn: Record<string, number>; play: Record<string, number> }>> {
-  const out = new Map<string, { signIn: Record<string, number>; play: Record<string, number> }>();
+/**
+ * When each user was last seen (any request with its sign-in) and last played
+ * something through this server; history imported from trackers does not count.
+ */
+async function activity(): Promise<Map<string, { seen: Record<string, number>; play: Record<string, number> }>> {
+  const out = new Map<string, { seen: Record<string, number>; play: Record<string, number> }>();
   const slot = (uuid: string) => {
-    if (!out.has(uuid)) out.set(uuid, { signIn: {}, play: {} });
+    if (!out.has(uuid)) out.set(uuid, { seen: {}, play: {} });
     return out.get(uuid)!;
   };
   const tokens = await database.allQuery('SELECT user_uuid, profile_id, MAX(last_used_at) AS at FROM jellyfin_tokens GROUP BY user_uuid, profile_id').catch(() => []);
-  for (const row of tokens) slot(row.user_uuid).signIn[row.profile_id || ''] = Number(row.at) || 0;
-  const plays = await database.allQuery('SELECT user_uuid, profile, MAX(updated_at) AS at FROM jellyfin_playstate GROUP BY user_uuid, profile').catch(() => []);
+  for (const row of tokens) slot(row.user_uuid).seen[row.profile_id || ''] = Number(row.at) || 0;
+  const plays = await database.allQuery(
+    "SELECT user_uuid, profile, MAX(last_played_at) AS at FROM jellyfin_playstate WHERE origin = 'server' OR origin IS NULL GROUP BY user_uuid, profile"
+  ).catch(() => []);
   for (const row of plays) slot(row.user_uuid).play[row.profile || ''] = Number(row.at) || 0;
   return out;
 }
@@ -114,7 +119,8 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
 
   route('get', '/overview', async (req, res) => {
     const [configs, seen] = await Promise.all([allConfigs(), activity()]);
-    await pruneManaged(new Set(configs.map((c) => c.uuid)));
+    // Every stored id, unreadable configs included, so only entries whose config is really gone are pruned.
+    await pruneManaged(new Set(await database.getAllUserUUIDs()));
     const managed = await listManaged();
     const managedBy = new Map(managed.map((m) => [m.uuid, m]));
     const streams = await streamsWithUsage(configs).catch((error) => {
@@ -144,7 +150,7 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
           streamName: config.jellyfinStreamUrl ? streamName.get(String(config.jellyfinStreamUrl).trim()) ?? null : null,
           users: usersOf(config).map((u) => ({
             ...u,
-            lastSignIn: act?.signIn[u.id] ?? null,
+            lastSeen: act?.seen[u.id] ?? null,
             lastPlay: act?.play[u.id] ?? null,
           })),
           createdAt,
@@ -166,7 +172,8 @@ export function registerJellyfinAdminRoutes(addon: any, requireDashboardAdmin: a
 
     const copy: any = {};
     for (const [key, value] of Object.entries(JSON.parse(JSON.stringify(source)))) {
-      if (!key.startsWith('jellyfin') && key !== 'configHash') copy[key] = value;
+      // The source's Jellyfin server and its AIOManager/Hydra accounts stay with the source.
+      if (!key.startsWith('jellyfin') && !['configHash', 'managers', 'managerAccounts'].includes(key)) copy[key] = value;
     }
     const uuid = database.generateUserUUID();
     await database.saveUserConfig(uuid, await database.hashPassword(password), { ...copy, configVersion: Date.now(), lastModified: Date.now() });
