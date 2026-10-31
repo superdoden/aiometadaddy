@@ -13,6 +13,7 @@ import { StreamPicker } from "@/components/jellyfin/StreamPicker";
 import { AdminJellyfinEditor } from "./AdminJellyfinEditor";
 import {
   aliasFromName,
+  configureUrlOf,
   newClientPassword,
   useJellyfinAdminApi,
   when,
@@ -590,6 +591,7 @@ function StreamRow({ api, entry, onChanged }: { api: JellyfinAdminApi; entry: St
   const [name, setName] = useState(entry.name);
   const [url, setUrl] = useState(entry.url);
   const [busy, setBusy] = useState(false);
+  const configureUrl = configureUrlOf(entry.url);
 
   const save = async () => {
     if (url.trim() !== entry.url && entry.usage > 0 && !window.confirm(`The address is used in ${entry.usage} place${entry.usage === 1 ? "" : "s"}. Change it there too?`)) return;
@@ -634,7 +636,12 @@ function StreamRow({ api, entry, onChanged }: { api: JellyfinAdminApi; entry: St
       <span className="w-48 shrink-0 truncate text-sm font-medium">{entry.name}</span>
       <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground" title={entry.url}>{entry.url}</span>
       <Badge variant="outline" className="text-[10px]">{entry.usage} in use</Badge>
-      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" aria-label="Edit" onClick={() => setEditing(true)}><Pencil className="h-3 w-3" /></Button>
+      {configureUrl ? (
+        <Button asChild variant="outline" size="sm" className="h-7 px-2 text-xs" title="Open this addon's configuration page">
+          <a href={configureUrl} target="_blank" rel="noreferrer"><ExternalLink className="mr-1 h-3 w-3" />Edit config</a>
+        </Button>
+      ) : null}
+      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" aria-label="Edit name and address" title="Edit name and address" onClick={() => setEditing(true)}><Pencil className="h-3 w-3" /></Button>
       <Button variant="ghost" size="sm" className="h-7 w-7 p-0 text-destructive" aria-label="Remove" disabled={entry.usage > 0} title={entry.usage > 0 ? "Still in use" : undefined} onClick={() => void remove()}><Trash2 className="h-3 w-3" /></Button>
     </div>
   );

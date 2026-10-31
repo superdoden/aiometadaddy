@@ -141,6 +141,24 @@ export function when(value: number | string | null | undefined): string {
   return new Date(ms).toLocaleDateString();
 }
 
+/**
+ * A Stremio addon's configuration page sits beside its manifest: …/manifest.json
+ * becomes …/configure (AIOStreams: /stremio/<uuid>/<password>/configure).
+ * Null when the address does not end in a manifest.
+ */
+export function configureUrlOf(manifestUrl: string): string | null {
+  try {
+    const url = new URL(manifestUrl.trim());
+    if (!/\/manifest\.json$/i.test(url.pathname)) return null;
+    url.pathname = url.pathname.replace(/\/manifest\.json$/i, "/configure");
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** The same alphabet the configuration page uses for client passwords. */
 export function newClientPassword(): string {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
