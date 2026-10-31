@@ -132,7 +132,10 @@ const initializationTasks: InitTask[] = [
   {
     key: 'wikiMappings',
     timeoutMs: 120_000,
-    run: () => initializeMappings(),
+    run: async () => {
+      await initializeMappings();
+      await require('./lib/id-mapper.js').recheckUntypedTmdb();
+    },
     summary: () => {
       const { getIdMappingsStats } = require('./lib/id-mappings.js');
       return `${getIdMappingsStats().totalCount.toLocaleString()} mappings`;
@@ -156,6 +159,18 @@ const initializationTasks: InitTask[] = [
     key: 'tmdbKeywordIndex',
     timeoutMs: 30_000,
     run: () => initializeTmdbKeywordIndex()
+  },
+  {
+    key: 'fillerData',
+    timeoutMs: 60_000,
+    run: () => require('./lib/fillerData').initializeFillerData(),
+    summary: () => require('./lib/fillerData').fillerDataStats()
+  },
+  {
+    key: 'animeSchedule',
+    timeoutMs: 60_000,
+    run: () => require('./lib/animeAiringSchedule').initializeAnimeSchedule(),
+    summary: () => require('./lib/animeAiringSchedule').animeScheduleStats()
   },
   {
     key: 'cacheCleanup',

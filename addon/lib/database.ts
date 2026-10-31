@@ -9,7 +9,19 @@ import consola from 'consola';
 
 const logger = consola.withTag('Database');
 
+export interface WatchPatch {
+  at: number;
+  kind: 'finish' | 'first' | 'dated';
+  gapMs?: number;
+}
+
 type DbType = 'sqlite' | 'postgres';
+
+// A row a tracker sync wrote rather than a play here: a tracker's origin, or an
+// unmarked row whose last play is not when it was written.
+const IMPORTED_PLAYSTATE = `(origin IS NOT NULL AND origin NOT IN ('server', 'play'))
+      OR ((origin IS NULL OR origin = 'play') AND (played = 1 OR position_ms > 0)
+        AND (last_played_at IS NULL OR ABS(updated_at - last_played_at) >= 2000))`;
 
 function dbTypeFromUri(uri: string | undefined): DbType | null {
   if (!uri) return null;
@@ -164,7 +176,10 @@ class Database {
     await this.ensureAccountColumns();
     await this.ensurePlaystateProfile();
     await this.ensurePlaystateOrigin();
+    await this.ensureWatches();
+    await this.ensureWatchlistMetaType();
     await this.ensureTrackerOutboxProfile();
+    await this.ensureRatingsMetaType();
   }
 
   /** The profile is part of the key, which neither dialect can add in place. */
@@ -248,6 +263,65 @@ class Database {
     }
   }
 
+  async ensureWatches(): Promise<void> {
+    try {
+      const sqlite = this.type === 'sqlite';
+      const existing = sqlite
+        ? await this.getQuery(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'jellyfin_watches'`)
+        : await this.getQuery(`SELECT table_name FROM information_schema.tables WHERE table_name = 'jellyfin_watches'`);
+      await this.runQuery(`CREATE TABLE IF NOT EXISTS jellyfin_watches (
+        user_uuid ${sqlite ? 'TEXT' : 'VARCHAR(64)'} NOT NULL,
+        profile TEXT NOT NULL DEFAULT '',
+        video_id TEXT NOT NULL,
+        watched_at ${sqlite ? 'INTEGER' : 'BIGINT'} NOT NULL,
+        origin TEXT,
+        PRIMARY KEY (user_uuid, profile, video_id, watched_at)
+      )`);
+      await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_jellyfin_watches_recent ON jellyfin_watches(user_uuid, profile, watched_at DESC)`);
+      await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_jellyfin_watches_at ON jellyfin_watches(watched_at)`);
+      if (existing) return;
+      const result = await this.runQuery(`INSERT INTO jellyfin_watches (user_uuid, profile, video_id, watched_at, origin)
+        SELECT user_uuid, profile, video_id, last_played_at, origin FROM jellyfin_playstate
+        WHERE played = 1 AND last_played_at IS NOT NULL AND position_ms = 0
+        ON CONFLICT DO NOTHING`);
+      logger.info(`Created jellyfin_watches with ${Number(sqlite ? result?.changes : result?.rowCount) || 0} watches from the play state`);
+    } catch (error: any) {
+      logger.warn(`Could not create jellyfin_watches: ${error.message}`);
+    }
+  }
+
+  async ensureWatchlistMetaType(): Promise<void> {
+    for (const table of ['jellyfin_watchlist', 'jellyfin_favourites']) {
+      try {
+        if (this.type === 'sqlite') {
+          const existing = await this.allQuery(`PRAGMA table_info(${table})`);
+          if (existing.some((column: any) => column.name === 'meta_type')) continue;
+          await this.runQuery(`ALTER TABLE ${table} ADD COLUMN meta_type TEXT`);
+          logger.info(`Migrated ${table}: rows record their meta type`);
+        } else {
+          await this.runQuery(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS meta_type TEXT`);
+        }
+      } catch (error: any) {
+        logger.warn(`Could not add ${table}.meta_type: ${error.message}`);
+      }
+    }
+  }
+
+  async ensureRatingsMetaType(): Promise<void> {
+    try {
+      if (this.type === 'sqlite') {
+        const existing = await this.allQuery(`PRAGMA table_info(jellyfin_ratings)`);
+        if (existing.some((column: any) => column.name === 'meta_type')) return;
+        await this.runQuery(`ALTER TABLE jellyfin_ratings ADD COLUMN meta_type TEXT`);
+        logger.info('Migrated jellyfin_ratings: rows record their meta type');
+      } else {
+        await this.runQuery(`ALTER TABLE jellyfin_ratings ADD COLUMN IF NOT EXISTS meta_type TEXT`);
+      }
+    } catch (error: any) {
+      logger.warn(`Could not add jellyfin_ratings.meta_type: ${error.message}`);
+    }
+  }
+
   async ensureTrackerOutboxProfile(): Promise<void> {
     try {
       if (this.type === 'sqlite') {
@@ -326,6 +400,7 @@ class Database {
         profile TEXT NOT NULL DEFAULT '',
         meta_id TEXT NOT NULL,
         media_type TEXT NOT NULL,
+        meta_type TEXT,
         listed INTEGER NOT NULL DEFAULT 1,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
@@ -372,6 +447,7 @@ class Database {
         last_error TEXT
       )`,
       `CREATE INDEX IF NOT EXISTS idx_tracker_outbox_coalesce ON tracker_outbox(lane, coalesce_key)`,
+      `CREATE INDEX IF NOT EXISTS idx_tracker_outbox_title ON tracker_outbox(lane, item_key, id)`,
       `CREATE TABLE IF NOT EXISTS jellyfin_watch_index (
         source_key TEXT NOT NULL,
         video_id TEXT NOT NULL,
@@ -403,6 +479,7 @@ class Database {
         profile TEXT NOT NULL DEFAULT '',
         meta_id TEXT NOT NULL,
         media_type TEXT NOT NULL,
+        meta_type TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
       )`,
@@ -551,6 +628,7 @@ class Database {
         profile TEXT NOT NULL DEFAULT '',
         meta_id TEXT NOT NULL,
         media_type TEXT NOT NULL,
+        meta_type TEXT,
         listed INTEGER NOT NULL DEFAULT 1,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
@@ -597,6 +675,7 @@ class Database {
         last_error TEXT
       )`,
       `CREATE INDEX IF NOT EXISTS idx_tracker_outbox_coalesce ON tracker_outbox(lane, coalesce_key)`,
+      `CREATE INDEX IF NOT EXISTS idx_tracker_outbox_title ON tracker_outbox(lane, item_key, id)`,
       `CREATE TABLE IF NOT EXISTS jellyfin_watch_index (
         source_key VARCHAR(64) NOT NULL,
         video_id TEXT NOT NULL,
@@ -628,6 +707,7 @@ class Database {
         profile TEXT NOT NULL DEFAULT '',
         meta_id TEXT NOT NULL,
         media_type TEXT NOT NULL,
+        meta_type TEXT,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (user_uuid, profile, meta_id)
       )`,
@@ -758,6 +838,18 @@ class Database {
     }
   }
 
+  async allPrimaryQuery(query: string, params: any[] = []): Promise<any[]> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    if (this.type === 'sqlite') {
+      return this.executeSQLiteStatement(this.db.prepare(query), 'all', params);
+    }
+    const result = await this.db.query(query, params);
+    return result.rows;
+  }
+
   generateUserUUID(): string {
     return crypto.randomUUID();
   }
@@ -776,7 +868,8 @@ class Database {
     }
 
     const newAppPassword = typeof normalizedConfig?.jellyfinAppPassword === 'string' ? normalizedConfig.jellyfinAppPassword : '';
-    const hasUsers = Array.isArray(normalizedConfig?.jellyfinUsers) && normalizedConfig.jellyfinUsers.length > 0;
+    const hasUsers = (Array.isArray(normalizedConfig?.jellyfinUsers) && normalizedConfig.jellyfinUsers.length > 0)
+      || Boolean(normalizedConfig && 'jellyfinUserPin' in normalizedConfig);
     const previousConfig = newAppPassword || hasUsers ? await this.getUserConfig(userUUID).catch(() => null) : null;
     const previousAppPassword = newAppPassword ? previousConfig?.jellyfinAppPassword : undefined;
     const pinChanged = hasUsers ? await require('./jellyfin/pins').securePins(normalizedConfig, previousConfig) : [];
@@ -833,7 +926,7 @@ class Database {
     }
     // A new or changed PIN signs that user out, so a device already signed in as them asks for it.
     for (const profileId of pinChanged) {
-      await require('./jellyfin/tokens').revokeUserTokens(userUUID, profileId).catch((error: any) => logger.warn(`Signing out ${userUUID} user ${profileId} failed: ${error.message}`));
+      await require('./jellyfin/tokens').revokeUserTokens(userUUID, profileId).catch((error: any) => logger.warn(`Signing out ${userUUID} user ${profileId ?? 'main'} failed: ${error.message}`));
     }
 
     try {
@@ -1014,6 +1107,7 @@ class Database {
     await this.runQuery(query, [userUUID]);
     await this.unlinkConfigFromAllAccounts(userUUID);
     await require('./configCache').del(userUUID).catch(() => undefined);
+    await require('./jellyfin/context').forgetSeen([userUUID]).catch(() => undefined);
   }
 
   async deleteUser(userUUID: string): Promise<boolean> {
@@ -1031,6 +1125,7 @@ class Database {
         : 'DELETE FROM trusted_uuids WHERE user_uuid = $1';
       await this.runQuery(deleteTrustedQuery, [userUUID]);
       await require('./jellyfin/tokens').revokeUserTokens(userUUID).catch(() => undefined);
+      await require('./jellyfin/context').forgetSeen([userUUID]).catch(() => undefined);
 
       const deleteAliasQuery = this.type === 'sqlite'
         ? 'DELETE FROM user_aliases WHERE user_uuid = ?'
@@ -1047,28 +1142,6 @@ class Database {
     } catch (error) {
       logger.error(`Error deleting user ${userUUID}:`, error);
       throw error;
-    }
-  }
-
-  async migrateFromLocalStorage(localStorageData: any, password: string): Promise<string | null> {
-    if (!localStorageData) return null;
-
-    try {
-      const config = typeof localStorageData === 'string'
-        ? JSON.parse(localStorageData)
-        : localStorageData;
-
-      const userUUID = this.generateUserUUID();
-
-      const passwordHash = crypto.createHash('sha256').update(password).digest('hex');
-
-      await this.saveUserConfig(userUUID, passwordHash, config);
-      logger.info('[Database] Migrated localStorage config for user:', userUUID);
-
-      return userUUID;
-    } catch (error) {
-      logger.error('Migration failed:', error);
-      return null;
     }
   }
 
@@ -1180,12 +1253,20 @@ class Database {
   ): Promise<void> {
     if (!rows.length) return;
 
-    const query = this.type === 'sqlite'
-      ? 'INSERT OR IGNORE INTO jellyfin_ids (id, payload, codec_version) VALUES (?, ?, ?)'
-      : 'INSERT INTO jellyfin_ids (id, payload, codec_version) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING';
-
-    for (const row of rows) {
-      await this.runQuery(query, [row.id, JSON.stringify(row.payload), row.codecVersion]);
+    // One statement per chunk, so a page of new ids is a few commits rather than hundreds.
+    const size = this.type === 'sqlite' ? 150 : 500;
+    for (let i = 0; i < rows.length; i += size) {
+      const chunk = rows.slice(i, i + size);
+      const params: any[] = [];
+      const values = chunk.map((row) => {
+        params.push(row.id, JSON.stringify(row.payload), row.codecVersion);
+        const at = params.length - 3;
+        return this.type === 'sqlite' ? '(?, ?, ?)' : `($${at + 1}, $${at + 2}, $${at + 3})`;
+      });
+      const query = this.type === 'sqlite'
+        ? `INSERT OR IGNORE INTO jellyfin_ids (id, payload, codec_version) VALUES ${values.join(', ')}`
+        : `INSERT INTO jellyfin_ids (id, payload, codec_version) VALUES ${values.join(', ')} ON CONFLICT (id) DO NOTHING`;
+      await this.runQuery(query, params);
     }
   }
 
@@ -1225,16 +1306,33 @@ class Database {
   }
 
   // Only plays with a time: history a sync copied from a tracker carries none.
+  async latestOwnPlayAmong(userUUID: string, profile: string, bases: string[]): Promise<{ videoId: string; at: number } | null> {
+    if (!bases.length) return null;
+    const p = this.type === 'sqlite' ? () => '?' : ((n = 0) => () => `$${++n}`)();
+    const params: any[] = [userUUID, profile];
+    const scope = `user_uuid = ${p()} AND profile = ${p()}`;
+    const spelled = bases.map((base) => {
+      params.push(`${base}:%`);
+      return `video_id LIKE ${p()}`;
+    });
+    const query = `SELECT video_id, last_played_at FROM jellyfin_playstate WHERE ${scope}
+      AND (origin = 'server' OR ((origin IS NULL OR origin = 'play') AND ABS(updated_at - last_played_at) < 2000))
+      AND last_played_at IS NOT NULL AND (played = 1 OR position_ms > 0) AND (${spelled.join(' OR ')})
+      ORDER BY last_played_at DESC, updated_at, video_id LIMIT 1`;
+    const row = await this.getQuery(query, params);
+    return row?.video_id ? { videoId: String(row.video_id), at: Number(row.last_played_at) } : null;
+  }
+
   async listRecentlyPlayed(
     userUUID: string,
     since: number,
     limit: number,
     profile = '',
     after: { at: number; videoId: string } | null = null
-  ): Promise<Array<{ video_id: string; last_played_at: number; updated_at: number }>> {
+  ): Promise<Array<{ video_id: string; last_played_at: number; updated_at: number; origin: string | null }>> {
     const p = this.type === 'sqlite' ? () => '?' : ((n = 0) => () => `$${++n}`)();
     const params: any[] = [userUUID, profile, since];
-    let query = `SELECT video_id, last_played_at, updated_at FROM jellyfin_playstate WHERE user_uuid = ${p()} AND profile = ${p()} AND played = 1 AND last_played_at >= ${p()} AND video_id LIKE '%:%:%'`;
+    let query = `SELECT video_id, last_played_at, updated_at, origin FROM jellyfin_playstate WHERE user_uuid = ${p()} AND profile = ${p()} AND played = 1 AND last_played_at >= ${p()} AND video_id LIKE '%:%:%'`;
     if (after) {
       query += ` AND (last_played_at < ${p()} OR (last_played_at = ${p()} AND video_id > ${p()}))`;
       params.push(after.at, after.at, after.videoId);
@@ -1276,6 +1374,13 @@ class Database {
     return (await this.allQuery(query, [userUUID])) || [];
   }
 
+  async outboxForConfiguration(userUUID: string, limit = 500): Promise<any[]> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT profile, service, attempts, created_at, last_error FROM tracker_outbox WHERE user_uuid = ? AND expires_at > ? ORDER BY id LIMIT ?'
+      : 'SELECT profile, service, attempts, created_at, last_error FROM tracker_outbox WHERE user_uuid = $1 AND expires_at > $2 ORDER BY id LIMIT $3';
+    return (await this.allQuery(query, [userUUID, Date.now(), limit])) || [];
+  }
+
   async findUserUUIDsByPrefix(prefix: string, limit: number): Promise<string[]> {
     const query = this.type === 'sqlite'
       ? 'SELECT user_uuid FROM user_configs WHERE user_uuid LIKE ? LIMIT ?'
@@ -1287,8 +1392,8 @@ class Database {
   async listPlaystateInProgressFor(userUUID: string, limit: number, profile: string | null = null): Promise<any[]> {
     const scoped = profile === null ? '' : (this.type === 'sqlite' ? ' AND profile = ?' : ' AND profile = $3');
     const query = this.type === 'sqlite'
-      ? `SELECT * FROM jellyfin_playstate WHERE user_uuid = ? AND position_ms > 0${scoped} ORDER BY COALESCE(last_played_at, updated_at) DESC LIMIT ?`
-      : `SELECT * FROM jellyfin_playstate WHERE user_uuid = $1 AND position_ms > 0${scoped} ORDER BY COALESCE(last_played_at, updated_at) DESC LIMIT $2`;
+      ? `SELECT * FROM jellyfin_playstate WHERE user_uuid = ? AND position_ms > 0${scoped} ORDER BY COALESCE(last_played_at, updated_at) DESC, updated_at, video_id LIMIT ?`
+      : `SELECT * FROM jellyfin_playstate WHERE user_uuid = $1 AND position_ms > 0${scoped} ORDER BY COALESCE(last_played_at, updated_at) DESC, updated_at, video_id LIMIT $2`;
     return (await this.allQuery(query, profile === null ? [userUUID, limit] : this.type === 'sqlite' ? [userUUID, profile, limit] : [userUUID, limit, profile])) || [];
   }
 
@@ -1325,18 +1430,27 @@ class Database {
   async upsertPlaystate(
     userUUID: string,
     videoId: string,
-    patch: { positionMs?: number; runtimeMs?: number; played?: boolean; lastPlayedAt?: number | null; origin?: string | null },
-    profile = ''
+    patch: { positionMs?: number; runtimeMs?: number; played?: boolean; lastPlayedAt?: number | null; origin?: string | null; watch?: WatchPatch },
+    profile = '',
+    writtenAt?: number
   ): Promise<void> {
     const existing = await this.getPlaystate(userUUID, videoId, profile);
-    const now = Date.now();
+    const now = writtenAt ?? Date.now();
 
     const positionMs = patch.positionMs ?? existing?.position_ms ?? 0;
     const runtimeMs = patch.runtimeMs ?? existing?.runtime_ms ?? 0;
     const played = patch.played ?? Boolean(existing?.played);
-    const playCount = (existing?.play_count ?? 0) + (patch.played === true && !existing?.played ? 1 : 0);
-    const lastPlayedAt = patch.lastPlayedAt === undefined ? (existing?.last_played_at ?? null) : patch.lastPlayedAt;
+    const becamePlayed = patch.played === true && !existing?.played;
     const origin = patch.origin === undefined ? (existing?.origin ?? null) : patch.origin;
+
+    let logged = false;
+    if (patch.played === false) {
+      await this.deleteWatches(userUUID, profile, videoId);
+    } else if (patch.watch && Number.isFinite(patch.watch.at) && patch.watch.at > 0) {
+      logged = await this.logWatch(userUUID, profile, videoId, patch.watch, Boolean(existing?.played), origin);
+    }
+    const playCount = (existing?.play_count ?? 0) + (becamePlayed || (logged && patch.watch?.kind === 'finish') ? 1 : 0);
+    const lastPlayedAt = patch.lastPlayedAt === undefined ? (existing?.last_played_at ?? null) : patch.lastPlayedAt;
 
     const query = this.type === 'sqlite'
       ? `INSERT INTO jellyfin_playstate (user_uuid, profile, video_id, position_ms, runtime_ms, played, play_count, last_played_at, updated_at, origin)
@@ -1355,14 +1469,179 @@ class Database {
     await this.runQuery(query, [userUUID, profile, videoId, positionMs, runtimeMs, played ? 1 : 0, playCount, lastPlayedAt, now, origin]);
   }
 
+  async logWatch(userUUID: string, profile: string, videoId: string, watch: WatchPatch, wasPlayed: boolean, origin: string | null): Promise<boolean> {
+    if (watch.kind === 'first' && wasPlayed) return false;
+    const sqlite = this.type === 'sqlite';
+    if (watch.kind !== 'first') {
+      const since = watch.kind === 'dated' ? 0 : Math.round(watch.at - Math.max(0, watch.gapMs ?? 0));
+      const held = await this.getQuery(
+        sqlite
+          ? 'SELECT 1 AS held FROM jellyfin_watches WHERE user_uuid = ? AND profile = ? AND video_id = ? AND watched_at >= ? LIMIT 1'
+          : 'SELECT 1 AS held FROM jellyfin_watches WHERE user_uuid = $1 AND profile = $2 AND video_id = $3 AND watched_at >= $4 LIMIT 1',
+        [userUUID, profile, videoId, since]
+      );
+      if (held) return false;
+    }
+    const result = await this.runQuery(
+      sqlite
+        ? 'INSERT INTO jellyfin_watches (user_uuid, profile, video_id, watched_at, origin) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING'
+        : 'INSERT INTO jellyfin_watches (user_uuid, profile, video_id, watched_at, origin) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
+      [userUUID, profile, videoId, Math.round(watch.at), origin]
+    );
+    return (Number(sqlite ? result?.changes : result?.rowCount) || 0) > 0;
+  }
+
+  async deleteWatches(userUUID: string, profile: string, videoId: string): Promise<void> {
+    const query = this.type === 'sqlite'
+      ? 'DELETE FROM jellyfin_watches WHERE user_uuid = ? AND profile = ? AND video_id = ?'
+      : 'DELETE FROM jellyfin_watches WHERE user_uuid = $1 AND profile = $2 AND video_id = $3';
+    await this.runQuery(query, [userUUID, profile, videoId]);
+  }
+
+  async listWatchesFor(userUUID: string, profile: string, videoIds: string[]): Promise<Array<{ video_id: string; watched_at: number; origin: string | null }>> {
+    const out: any[] = [];
+    const ids = [...new Set(videoIds)];
+    for (let at = 0; at < ids.length; at += 500) {
+      const chunk = ids.slice(at, at + 500);
+      const marks = chunk.map((_, i) => (this.type === 'sqlite' ? '?' : `$${i + 3}`)).join(', ');
+      const query = this.type === 'sqlite'
+        ? `SELECT video_id, watched_at, origin FROM jellyfin_watches WHERE user_uuid = ? AND profile = ? AND video_id IN (${marks})`
+        : `SELECT video_id, watched_at, origin FROM jellyfin_watches WHERE user_uuid = $1 AND profile = $2 AND video_id IN (${marks})`;
+      out.push(...((await this.allQuery(query, [userUUID, profile, ...chunk])) || []));
+    }
+    return out.map((row) => ({ video_id: String(row.video_id), watched_at: Number(row.watched_at), origin: row.origin ?? null }));
+  }
+
+  async watchedVideoIds(userUUID: string, profile = ''): Promise<Set<string>> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT DISTINCT video_id FROM jellyfin_watches WHERE user_uuid = ? AND profile = ?'
+      : 'SELECT DISTINCT video_id FROM jellyfin_watches WHERE user_uuid = $1 AND profile = $2';
+    return new Set(((await this.allQuery(query, [userUUID, profile])) || []).map((row: any) => String(row.video_id)));
+  }
+
+  async listViewingHistory(userUUID: string, limit: number, profile: string | null = null): Promise<any[]> {
+    const sqlite = this.type === 'sqlite';
+    const scoped = profile === null ? '' : ` AND w.profile = ${sqlite ? '?' : '$3'}`;
+    const query = `SELECT w.profile, w.video_id, w.watched_at, w.origin,
+        p.position_ms, p.runtime_ms, p.played, p.last_played_at, p.updated_at,
+        (SELECT COUNT(*) FROM jellyfin_watches e WHERE e.user_uuid = w.user_uuid AND e.profile = w.profile AND e.video_id = w.video_id AND e.watched_at < w.watched_at) AS earlier
+      FROM jellyfin_watches w
+      LEFT JOIN jellyfin_playstate p ON p.user_uuid = w.user_uuid AND p.profile = w.profile AND p.video_id = w.video_id
+      WHERE w.user_uuid = ${sqlite ? '?' : '$1'}${scoped}
+      ORDER BY w.watched_at DESC, p.updated_at IS NULL, p.updated_at, w.video_id LIMIT ${sqlite ? '?' : '$2'}`;
+    const params = profile === null ? [userUUID, limit] : sqlite ? [userUUID, profile, limit] : [userUUID, limit, profile];
+    return (await this.allQuery(query, params)) || [];
+  }
+
+  async listWatchesSince(userUUID: string, since: number): Promise<Array<{ profile: string; video_id: string; watched_at: number }>> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT profile, video_id, watched_at FROM jellyfin_watches WHERE user_uuid = ? AND watched_at >= ?'
+      : 'SELECT profile, video_id, watched_at FROM jellyfin_watches WHERE user_uuid = $1 AND watched_at >= $2';
+    return ((await this.allQuery(query, [userUUID, since])) || []).map((row: any) => ({ profile: String(row.profile ?? ''), video_id: String(row.video_id), watched_at: Number(row.watched_at) }));
+  }
+
+  async listWatchesForConfiguration(userUUID: string): Promise<any[]> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT profile, video_id, watched_at, origin FROM jellyfin_watches WHERE user_uuid = ? ORDER BY profile, watched_at DESC'
+      : 'SELECT profile, video_id, watched_at, origin FROM jellyfin_watches WHERE user_uuid = $1 ORDER BY profile, watched_at DESC';
+    return (await this.allQuery(query, [userUUID])) || [];
+  }
+
+  async countWatchesSince(since: number): Promise<number> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT COUNT(*) AS count FROM (SELECT DISTINCT user_uuid, profile, watched_at FROM jellyfin_watches WHERE watched_at >= ?) w'
+      : 'SELECT COUNT(*) AS count FROM (SELECT DISTINCT user_uuid, profile, watched_at FROM jellyfin_watches WHERE watched_at >= $1) w';
+    const row = await this.getQuery(query, [since]);
+    return Number(row?.count) || 0;
+  }
+
+  /** A title's play state, newest first, for the profiles given; imported rows left out for localOnly. */
+  async listHistoryRows(
+    userUUID: string,
+    profiles: string[],
+    opts: { limit: number; after?: { sortAt: number; profile: string; videoId: string }; localOnly?: boolean }
+  ): Promise<any[]> {
+    if (!profiles.length) return [];
+    const params: any[] = [];
+    const mark = (value: any) => {
+      params.push(value);
+      return this.type === 'sqlite' ? '?' : `$${params.length}`;
+    };
+    const sortAt = 'COALESCE(last_played_at, updated_at)';
+    const where = [
+      `user_uuid = ${mark(userUUID)}`,
+      `profile IN (${profiles.map((profile) => mark(profile)).join(', ')})`,
+      '(played = 1 OR position_ms > 0)',
+    ];
+    if (opts.localOnly) where.push(`NOT (${IMPORTED_PLAYSTATE})`);
+    if (opts.after) {
+      const at = mark(opts.after.sortAt);
+      const at2 = mark(opts.after.sortAt);
+      const profile = mark(opts.after.profile);
+      const profile2 = mark(opts.after.profile);
+      const videoId = mark(opts.after.videoId);
+      where.push(`(${sortAt} < ${at} OR (${sortAt} = ${at2} AND (profile > ${profile} OR (profile = ${profile2} AND video_id > ${videoId}))))`);
+    }
+    const limit = mark(opts.limit);
+    const query = `SELECT profile, video_id, position_ms, runtime_ms, played, play_count, last_played_at, updated_at, origin, ${sortAt} AS sort_at
+      FROM jellyfin_playstate WHERE ${where.join(' AND ')}
+      ORDER BY sort_at DESC, profile, video_id LIMIT ${limit}`;
+    return (await this.allQuery(query, params)) || [];
+  }
+
+  /** The profiles' played and started rows in key order, a page at a time, for an export. */
+  async listPlaystatePage(userUUID: string, profiles: string[], limit: number, after?: { profile: string; videoId: string }): Promise<any[]> {
+    if (!profiles.length) return [];
+    const params: any[] = [];
+    const mark = (value: any) => {
+      params.push(value);
+      return this.type === 'sqlite' ? '?' : `$${params.length}`;
+    };
+    const where = [
+      `user_uuid = ${mark(userUUID)}`,
+      `profile IN (${profiles.map((profile) => mark(profile)).join(', ')})`,
+      '(played = 1 OR position_ms > 0)',
+    ];
+    if (after) {
+      const profile = mark(after.profile);
+      const profile2 = mark(after.profile);
+      const videoId = mark(after.videoId);
+      where.push(`(profile > ${profile} OR (profile = ${profile2} AND video_id > ${videoId}))`);
+    }
+    const query = `SELECT profile, video_id, position_ms, runtime_ms, played, play_count, last_played_at, updated_at, origin
+      FROM jellyfin_playstate WHERE ${where.join(' AND ')} ORDER BY profile, video_id LIMIT ${mark(limit)}`;
+    return (await this.allQuery(query, params)) || [];
+  }
+
+  /** Removes a profile's play state and watches, for the titles given or all of them. */
+  async clearHistory(userUUID: string, profile: string, videoIds?: string[]): Promise<number> {
+    const sqlite = this.type === 'sqlite';
+    const scoped = (table: string, ids: string[] | undefined) => {
+      const params: any[] = [userUUID, profile, ...(ids ?? [])];
+      const marks = (ids ?? []).map((_, i) => (sqlite ? '?' : `$${i + 3}`)).join(', ');
+      const where = `user_uuid = ${sqlite ? '?' : '$1'} AND profile = ${sqlite ? '?' : '$2'}${ids ? ` AND video_id IN (${marks})` : ''}`;
+      return { sql: `DELETE FROM ${table} WHERE ${where}`, params };
+    };
+    let cleared = 0;
+    const chunks = videoIds ? Array.from({ length: Math.ceil(videoIds.length / 500) }, (_, i) => videoIds.slice(i * 500, i * 500 + 500)) : [undefined];
+    for (const ids of chunks) {
+      const playstate = scoped('jellyfin_playstate', ids);
+      const result = await this.runQuery(playstate.sql, playstate.params);
+      cleared += Number(sqlite ? result?.changes : result?.rowCount) || 0;
+      const watches = scoped('jellyfin_watches', ids);
+      await this.runQuery(watches.sql, watches.params);
+    }
+    return cleared;
+  }
+
   async deleteImportedPlaystate(userUUID: string, profile: string): Promise<number> {
     const [a, b] = this.type === 'sqlite' ? ['?', '?'] : ['$1', '$2'];
-    const imported = `(origin IS NOT NULL AND origin NOT IN ('server', 'play'))
-      OR ((origin IS NULL OR origin = 'play') AND (played = 1 OR position_ms > 0)
-        AND (last_played_at IS NULL OR ABS(updated_at - last_played_at) >= 2000))`;
-    const where = `user_uuid = ${a} AND profile = ${b} AND (${imported})`;
+    const where = `user_uuid = ${a} AND profile = ${b} AND (${IMPORTED_PLAYSTATE})`;
     const counted: any = await this.getQuery(`SELECT COUNT(*) AS count FROM jellyfin_playstate WHERE ${where}`, [userUUID, profile]);
     await this.runQuery(`DELETE FROM jellyfin_playstate WHERE ${where}`, [userUUID, profile]);
+    await this.runQuery(`DELETE FROM jellyfin_watches WHERE user_uuid = ${a} AND profile = ${b} AND (
+      (origin IS NOT NULL AND origin NOT IN ('server', 'play'))
+      OR NOT EXISTS (SELECT 1 FROM jellyfin_playstate p WHERE p.user_uuid = jellyfin_watches.user_uuid AND p.profile = jellyfin_watches.profile AND p.video_id = jellyfin_watches.video_id))`, [userUUID, profile]);
     return Number(counted?.count) || 0;
   }
 
@@ -1390,19 +1669,26 @@ class Database {
 
   async listWatchlist(userUUID: string, profile = ''): Promise<any[]> {
     const query = this.type === 'sqlite'
-      ? 'SELECT meta_id, media_type, listed, updated_at FROM jellyfin_watchlist WHERE user_uuid = ? AND profile = ? ORDER BY updated_at DESC'
-      : 'SELECT meta_id, media_type, listed, updated_at FROM jellyfin_watchlist WHERE user_uuid = $1 AND profile = $2 ORDER BY updated_at DESC';
+      ? 'SELECT meta_id, media_type, meta_type, listed, updated_at FROM jellyfin_watchlist WHERE user_uuid = ? AND profile = ? ORDER BY updated_at DESC'
+      : 'SELECT meta_id, media_type, meta_type, listed, updated_at FROM jellyfin_watchlist WHERE user_uuid = $1 AND profile = $2 ORDER BY updated_at DESC';
     return this.allQuery(query, [userUUID, profile]);
   }
 
   // listed=0 is a removal kept until the trackers stop listing the title.
-  async setWatchlisted(userUUID: string, profile: string, metaId: string, mediaType: string, listed: boolean): Promise<void> {
+  async setWatchlisted(userUUID: string, profile: string, metaId: string, mediaType: string, listed: boolean, metaType: string | null = null, updatedAt = Date.now()): Promise<void> {
     const query = this.type === 'sqlite'
-      ? `INSERT INTO jellyfin_watchlist (user_uuid, profile, meta_id, media_type, listed, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = excluded.media_type, listed = excluded.listed, updated_at = excluded.updated_at`
-      : `INSERT INTO jellyfin_watchlist (user_uuid, profile, meta_id, media_type, listed, updated_at) VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = EXCLUDED.media_type, listed = EXCLUDED.listed, updated_at = EXCLUDED.updated_at`;
-    await this.runQuery(query, [userUUID, profile, metaId, mediaType, listed ? 1 : 0, Date.now()]);
+      ? `INSERT INTO jellyfin_watchlist (user_uuid, profile, meta_id, media_type, meta_type, listed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = excluded.media_type, meta_type = COALESCE(excluded.meta_type, jellyfin_watchlist.meta_type), listed = excluded.listed, updated_at = excluded.updated_at`
+      : `INSERT INTO jellyfin_watchlist (user_uuid, profile, meta_id, media_type, meta_type, listed, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = EXCLUDED.media_type, meta_type = COALESCE(EXCLUDED.meta_type, jellyfin_watchlist.meta_type), listed = EXCLUDED.listed, updated_at = EXCLUDED.updated_at`;
+    await this.runQuery(query, [userUUID, profile, metaId, mediaType, metaType, listed ? 1 : 0, updatedAt]);
+  }
+
+  async setMetaType(table: 'jellyfin_watchlist', userUUID: string, profile: string, metaId: string, metaType: string): Promise<void> {
+    const query = this.type === 'sqlite'
+      ? `UPDATE ${table} SET meta_type = ? WHERE user_uuid = ? AND profile = ? AND meta_id = ?`
+      : `UPDATE ${table} SET meta_type = $1 WHERE user_uuid = $2 AND profile = $3 AND meta_id = $4`;
+    await this.runQuery(query, [metaType, userUUID, profile, metaId]);
   }
 
   // How a tracker names an episode or film, resolved to the ids this server publishes.
@@ -1458,10 +1744,18 @@ class Database {
     }
   }
 
-  async listTrackerOutbox(limit: number): Promise<any[]> {
-    const rows = await this.allQuery(
-      `SELECT id, lane, user_uuid, profile, service, op, item_key, payload, attempts, next_at, expires_at, claimed_until, created_at FROM tracker_outbox ORDER BY id LIMIT ${this.type === 'sqlite' ? '?' : '$1'}`,
-      [limit]
+  async readyTrackerOutbox(now: number, limit: number): Promise<any[]> {
+    const sqlite = this.type === 'sqlite';
+    const at = sqlite ? '?' : '$1';
+    const rows = await this.allPrimaryQuery(
+      `SELECT id, lane, user_uuid, profile, service, op, item_key, payload, attempts, next_at, expires_at, claimed_until, created_at FROM (
+         SELECT o.*, ROW_NUMBER() OVER (PARTITION BY o.lane ORDER BY o.id) AS lane_rank
+         FROM tracker_outbox o
+         WHERE o.next_at <= ${at} AND o.claimed_until <= ${at}
+           AND NOT EXISTS (SELECT 1 FROM tracker_outbox c WHERE c.lane = o.lane AND c.claimed_until > ${at})
+           AND NOT EXISTS (SELECT 1 FROM tracker_outbox w WHERE w.lane = o.lane AND w.item_key = o.item_key AND w.id < o.id AND w.next_at > ${at})
+       ) ready WHERE lane_rank = 1 ORDER BY id LIMIT ${sqlite ? '?' : '$2'}`,
+      sqlite ? [now, now, now, now, limit] : [now, limit]
     );
     // Postgres hands BIGINT back as a string.
     return rows.map((row: any) => ({
@@ -1473,6 +1767,27 @@ class Database {
       claimed_until: Number(row.claimed_until),
       created_at: Number(row.created_at),
     }));
+  }
+
+  async trackerOutboxWakeAt(now: number): Promise<number | null> {
+    const sqlite = this.type === 'sqlite';
+    const at = sqlite ? '?' : '$1';
+    const [row] = await this.allPrimaryQuery(
+      `SELECT MIN(CASE WHEN claimed_until > ${at} THEN claimed_until ELSE next_at END) AS wake_at FROM tracker_outbox WHERE claimed_until > ${at} OR next_at > ${at}`,
+      sqlite ? [now, now, now] : [now]
+    );
+    const wakeAt = Number(row?.wake_at);
+    return Number.isFinite(wakeAt) && wakeAt > 0 ? wakeAt : null;
+  }
+
+  async purgeTrackerOutbox(now: number): Promise<number> {
+    const result = await this.runQuery(
+      this.type === 'sqlite'
+        ? 'DELETE FROM tracker_outbox WHERE expires_at <= ? AND claimed_until <= ?'
+        : 'DELETE FROM tracker_outbox WHERE expires_at <= $1 AND claimed_until <= $1',
+      this.type === 'sqlite' ? [now, now] : [now]
+    );
+    return Number(result?.changes ?? result?.rowCount ?? 0);
   }
 
   async claimTrackerOutbox(id: number, until: number): Promise<boolean> {
@@ -1737,30 +2052,6 @@ class Database {
     await this.runQuery(`DELETE FROM jellyfin_tracker_mirror WHERE source_key = ${sqlite ? '?' : '$1'} AND group_key = ${sqlite ? '?' : '$2'} AND sub_key = ${sqlite ? '?' : '$3'}`, [sourceKey, group, sub]);
   }
 
-  // Favourites for a client with a watchlist of its own; only kept here, never on a tracker.
-  async listFavourites(userUUID: string, profile = ''): Promise<any[]> {
-    const query = this.type === 'sqlite'
-      ? 'SELECT meta_id, media_type, updated_at FROM jellyfin_favourites WHERE user_uuid = ? AND profile = ? ORDER BY updated_at DESC'
-      : 'SELECT meta_id, media_type, updated_at FROM jellyfin_favourites WHERE user_uuid = $1 AND profile = $2 ORDER BY updated_at DESC';
-    return this.allQuery(query, [userUUID, profile]);
-  }
-
-  async setFavourite(userUUID: string, profile: string, metaId: string, mediaType: string, favourite: boolean): Promise<void> {
-    if (favourite) {
-      const query = this.type === 'sqlite'
-        ? `INSERT INTO jellyfin_favourites (user_uuid, profile, meta_id, media_type, updated_at) VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = excluded.media_type, updated_at = excluded.updated_at`
-        : `INSERT INTO jellyfin_favourites (user_uuid, profile, meta_id, media_type, updated_at) VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET media_type = EXCLUDED.media_type, updated_at = EXCLUDED.updated_at`;
-      await this.runQuery(query, [userUUID, profile, metaId, mediaType, Date.now()]);
-      return;
-    }
-    const query = this.type === 'sqlite'
-      ? 'DELETE FROM jellyfin_favourites WHERE user_uuid = ? AND profile = ? AND meta_id = ?'
-      : 'DELETE FROM jellyfin_favourites WHERE user_uuid = $1 AND profile = $2 AND meta_id = $3';
-    await this.runQuery(query, [userUUID, profile, metaId]);
-  }
-
   async listDropped(userUUID: string, profile = ''): Promise<any[]> {
     const query = this.type === 'sqlite'
       ? 'SELECT meta_id, updated_at FROM jellyfin_dropped WHERE user_uuid = ? AND profile = ?'
@@ -1793,13 +2084,42 @@ class Database {
     return this.allQuery(query, [userUUID, profile, ...metaIds]);
   }
 
-  async setRating(userUUID: string, profile: string, metaIds: string[], rating: number | null): Promise<void> {
+  async listProfileRatings(userUUID: string, profile: string, limit: number): Promise<any[]> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT meta_id, rating, meta_type, updated_at FROM jellyfin_ratings WHERE user_uuid = ? AND profile = ? ORDER BY updated_at DESC LIMIT ?'
+      : 'SELECT meta_id, rating, meta_type, updated_at FROM jellyfin_ratings WHERE user_uuid = $1 AND profile = $2 ORDER BY updated_at DESC LIMIT $3';
+    return (await this.allQuery(query, [userUUID, profile, limit])) || [];
+  }
+
+  async listPlayedForProfile(userUUID: string, profile: string): Promise<any[]> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT video_id, played, position_ms, runtime_ms, play_count, last_played_at, updated_at, origin FROM jellyfin_playstate WHERE user_uuid = ? AND profile = ? AND (played = 1 OR position_ms > 0)'
+      : 'SELECT video_id, played, position_ms, runtime_ms, play_count, last_played_at, updated_at, origin FROM jellyfin_playstate WHERE user_uuid = $1 AND profile = $2 AND (played = 1 OR position_ms > 0)';
+    return (await this.allQuery(query, [userUUID, profile])) || [];
+  }
+
+  async hasPlays(userUUID: string): Promise<boolean> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT 1 AS found FROM jellyfin_playstate WHERE user_uuid = ? AND played = 1 LIMIT 1'
+      : 'SELECT 1 AS found FROM jellyfin_playstate WHERE user_uuid = $1 AND played = 1 LIMIT 1';
+    return !!(await this.getQuery(query, [userUUID]));
+  }
+
+  async playstateVersion(userUUID: string, profile: string): Promise<string> {
+    const query = this.type === 'sqlite'
+      ? 'SELECT COUNT(*) AS n, MAX(COALESCE(last_played_at, updated_at)) AS at FROM jellyfin_playstate WHERE user_uuid = ? AND profile = ? AND played = 1'
+      : 'SELECT COUNT(*) AS n, MAX(COALESCE(last_played_at, updated_at)) AS at FROM jellyfin_playstate WHERE user_uuid = $1 AND profile = $2 AND played = 1';
+    const row = await this.getQuery(query, [userUUID, profile]);
+    return `${Number(row?.n) || 0}-${Number(row?.at) || 0}`;
+  }
+
+  async setRating(userUUID: string, profile: string, metaIds: string[], rating: number | null, metaType: string | null = null): Promise<void> {
     for (const metaId of metaIds) {
       if (rating !== null) {
         const query = this.type === 'sqlite'
-          ? 'INSERT INTO jellyfin_ratings (user_uuid, profile, meta_id, rating, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET rating = excluded.rating, updated_at = excluded.updated_at'
-          : 'INSERT INTO jellyfin_ratings (user_uuid, profile, meta_id, rating, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET rating = EXCLUDED.rating, updated_at = EXCLUDED.updated_at';
-        await this.runQuery(query, [userUUID, profile, metaId, rating, Date.now()]);
+          ? 'INSERT INTO jellyfin_ratings (user_uuid, profile, meta_id, rating, meta_type, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET rating = excluded.rating, meta_type = COALESCE(excluded.meta_type, jellyfin_ratings.meta_type), updated_at = excluded.updated_at'
+          : 'INSERT INTO jellyfin_ratings (user_uuid, profile, meta_id, rating, meta_type, updated_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (user_uuid, profile, meta_id) DO UPDATE SET rating = EXCLUDED.rating, meta_type = COALESCE(EXCLUDED.meta_type, jellyfin_ratings.meta_type), updated_at = EXCLUDED.updated_at';
+        await this.runQuery(query, [userUUID, profile, metaId, rating, metaType, Date.now()]);
       } else {
         const query = this.type === 'sqlite'
           ? 'DELETE FROM jellyfin_ratings WHERE user_uuid = ? AND profile = ? AND meta_id = ?'
@@ -1858,7 +2178,14 @@ class Database {
     await this.runQuery(query, [userUUID]);
   }
 
-  async deleteJellyfinTokensForProfile(userUUID: string, profileId: string): Promise<void> {
+  async deleteJellyfinTokensForProfile(userUUID: string, profileId: string | null): Promise<void> {
+    if (profileId === null) {
+      const query = this.type === 'sqlite'
+        ? 'DELETE FROM jellyfin_tokens WHERE user_uuid = ? AND profile_id IS NULL'
+        : 'DELETE FROM jellyfin_tokens WHERE user_uuid = $1 AND profile_id IS NULL';
+      await this.runQuery(query, [userUUID]);
+      return;
+    }
     const query = this.type === 'sqlite'
       ? 'DELETE FROM jellyfin_tokens WHERE user_uuid = ? AND profile_id = ?'
       : 'DELETE FROM jellyfin_tokens WHERE user_uuid = $1 AND profile_id = $2';
@@ -2218,8 +2545,12 @@ class Database {
       const query = this.type === 'sqlite'
         ? 'DELETE FROM user_configs WHERE updated_at < ? AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)'
         : 'DELETE FROM user_configs WHERE updated_at < $1 AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)';
+      const doomed = await this.allQuery(this.type === 'sqlite'
+        ? 'SELECT user_uuid FROM user_configs WHERE updated_at < ? AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)'
+        : 'SELECT user_uuid FROM user_configs WHERE updated_at < $1 AND user_uuid NOT IN (SELECT uuid FROM jfa_managed)', [cutoffDateStr]);
 
       const result = await this.runQuery(query, [cutoffDateStr]);
+      await require('./jellyfin/context').forgetSeen((doomed || []).map((row: any) => String(row.user_uuid))).catch(() => undefined);
 
       await this.runAliasCleanup(
         'DELETE FROM user_aliases WHERE user_uuid NOT IN (SELECT user_uuid FROM user_configs)'

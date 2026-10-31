@@ -41,6 +41,7 @@ function getImageWarmDetail() {
 }
 
 const { getCacheHealth, getMemoryStats: getCacheMemoryStats } = require('./getCache');
+const { forgetAllHeld } = require('./metaMemory');
 
 /** System keys that must survive any cache clear. */
 const { EPOCH_STATE_KEY } = require('./epochCleanup');
@@ -656,8 +657,9 @@ class DashboardAPI {
         },
         {
           name: "MAL",
-          keyStatus: null, // Doesn't require API key
+          keyStatus: require('./mal').isJikanEnabled() ? null : "Disabled",
           requiresKey: false,
+          off: !require('./mal').isJikanEnabled(),
         },
         {
           name: "Kitsu",
@@ -727,7 +729,7 @@ class DashboardAPI {
             // Determine health status based purely on success/failure metrics
             let status = "healthy";
             
-            if (totalCalls === 0) {
+            if (totalCalls === 0 || provider.off) {
               status = "unknown";
             } else if (totalCalls >= minCalls) {
               if (successRate < 50) {
@@ -1719,6 +1721,100 @@ class DashboardAPI {
         });
       }
 
+      // 14. Filler data
+      try {
+        const { getFillerDataStats } = require('./fillerData');
+        const fillerStats = getFillerDataStats();
+        const status = !fillerStats.enabled
+          ? "disabled"
+          : fillerStats.running
+            ? "running"
+            : fillerStats.lastError
+              ? "error"
+              : fillerStats.loaded ? "completed" : "scheduled";
+
+        let nextRunDisplay = "Disabled";
+        if (fillerStats.enabled) {
+          const nextRunTime = (fillerStats.lastCheck || 0) + fillerStats.refreshHours * 60 * 60 * 1000;
+          nextRunDisplay = nextRunTime > Date.now() ? this.getTimeUntil(new Date(nextRunTime)) : "On next request";
+        }
+        const detail = fillerStats.lastError
+          ? `last refresh failed: ${fillerStats.lastError}`
+          : `${fillerStats.anime.toLocaleString()} anime${fillerStats.generated ? `, file built ${this.getTimeAgo(new Date(fillerStats.generated))}` : ""}`;
+
+        tasks.push({
+          id: 14,
+          name: "Update Filler Data",
+          status,
+          lastRun: fillerStats.lastRefreshAt ? this.getTimeAgo(new Date(fillerStats.lastRefreshAt)) : "Never",
+          description: `Filler, mixed canon/filler and recap episodes for anime (${detail})`,
+          nextRun: nextRunDisplay,
+          action: fillerStats.enabled ? "restart" : null,
+          category: "mapping"
+        });
+      } catch (error) {
+        logger.warn("Failed to get filler data status:", error.message);
+        tasks.push({
+          id: 14,
+          name: "Update Filler Data",
+          status: "error",
+          lastRun: "Unknown",
+          description: "Filler, mixed canon/filler and recap episodes for anime",
+          nextRun: "Unknown",
+          action: "restart",
+          category: "mapping"
+        });
+      }
+
+      // 13. Anime release schedule (AniSchedule), refreshed in memory as requests arrive
+      try {
+        const { getAnimeScheduleStats } = require('./animeAiringSchedule');
+        const scheduleStats = getAnimeScheduleStats();
+        const status = !scheduleStats.enabled
+          ? "disabled"
+          : scheduleStats.running
+            ? "running"
+            : scheduleStats.lastError
+              ? "error"
+              : scheduleStats.loaded ? "completed" : "scheduled";
+
+        let nextRunDisplay = "Disabled";
+        if (scheduleStats.enabled) {
+          const nextRunTime = (scheduleStats.lastCheck || 0) + scheduleStats.refreshMinutes * 60 * 1000;
+          nextRunDisplay = nextRunTime > Date.now() ? this.getTimeUntil(new Date(nextRunTime)) : "On next request";
+        }
+
+        const source = scheduleStats.sourceUpdatedAt
+          ? `, source updated ${this.getTimeAgo(new Date(scheduleStats.sourceUpdatedAt))}${scheduleStats.stale ? ", stale: earliest times read from AniList" : ""}`
+          : "";
+        const detail = scheduleStats.lastError
+          ? `last refresh failed: ${scheduleStats.lastError}`
+          : `${scheduleStats.anime.toLocaleString()} anime, ${scheduleStats.dubbed.toLocaleString()} with dub times${source}`;
+
+        tasks.push({
+          id: 13,
+          name: "Update Anime Release Schedule",
+          status,
+          lastRun: scheduleStats.lastRefreshAt ? this.getTimeAgo(new Date(scheduleStats.lastRefreshAt)) : "Never",
+          description: `Earliest release and English dub times for anime episodes (${detail})`,
+          nextRun: nextRunDisplay,
+          action: scheduleStats.enabled ? "restart" : null,
+          category: "mapping"
+        });
+      } catch (error) {
+        logger.warn("Failed to get anime release schedule status:", error.message);
+        tasks.push({
+          id: 13,
+          name: "Update Anime Release Schedule",
+          status: "error",
+          lastRun: "Unknown",
+          description: "Earliest release and English dub times for anime episodes",
+          nextRun: "Unknown",
+          action: "restart",
+          category: "mapping"
+        });
+      }
+
       // 5. ID Mappings update task (scheduled every WIKI_MAPPER_UPDATE_INTERVAL_HOURS)
       try {
         const wikiMapperStats = getIdMappingsStats();
@@ -1958,6 +2054,8 @@ class DashboardAPI {
             isRunning: catalogStats.isRunning,
             catalogsWarmed: catalogStats.catalogsWarmed || 0,
             totalCatalogs: catalogStats.totalCatalogs || 0,
+            pinnedWarmed: catalogStats.pinnedWarmed || 0,
+            totalPinned: catalogStats.totalPinned || 0,
             totalItems: catalogStats.totalItems || 0,
             uuids: (catalogStats.config?.uuids || []).map(uuid => ({
               uuid: uuid.slice(0, 8),
@@ -2068,6 +2166,7 @@ class DashboardAPI {
           const batch = expiringKeysBatch.slice(i, i + deleteBatchSize);
           await this.cache.del(...batch);
           deletedCount += batch.length;
+          forgetAllHeld();
         }
       }
     } while (cursor !== '0');
@@ -2220,6 +2319,7 @@ class DashboardAPI {
               const batch = deletable.slice(i, i + 100);
               await this.cache.del(...batch);
               deletedCount += batch.length;
+              forgetAllHeld();
             }
           } else {
             deletedCount += deletable.length;
@@ -2288,6 +2388,7 @@ class DashboardAPI {
     const pattern = `*:${escapeRedisGlob(trimmed)}`;
     let cursor = '0';
     let deleted = 0;
+    if (!dryRun) forgetAllHeld();
 
     do {
       const reply = await this.cache.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
@@ -2307,6 +2408,7 @@ class DashboardAPI {
       }
     } while (cursor !== '0');
 
+    if (!dryRun) forgetAllHeld();
     return deleted;
   }
 
@@ -2317,6 +2419,7 @@ class DashboardAPI {
       }
 
       let deletedCount = 0;
+      forgetAllHeld();
       let cursor = '0';
       
       switch (type) {
@@ -2384,6 +2487,7 @@ class DashboardAPI {
         message = `Cleared ${deletedCount.toLocaleString()} ${type} cache entries`;
       }
 
+      forgetAllHeld();
       return { success: true, message, keyCount: finalKeyCount, deletedCount };
     } catch (error) {
       logger.error("Error clearing cache:", error);

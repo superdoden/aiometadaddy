@@ -1,5 +1,7 @@
 import { LRUCache } from 'lru-cache';
-import { readsBySeason, withEpisodeOrder } from '../utils/episodeOrder';
+import { readsBySeason, seasonNumberingProfile, withEpisodeOrder } from '../utils/episodeOrder';
+import { applyContentRatingProjection, ratingLinkNames, stripRatingLinks } from '../utils/contentRating';
+import { applySeasonNumberingProjection, predatesSeasonNumbering } from './seasonNumberingProjection';
 import type { MetaHashEntry } from './metaHashStore';
 const redis: any = require('./redisClient');
 const { loadConfigFromDatabase }: any = require('./configApi');
@@ -9,9 +11,11 @@ const { isMetricsDisabled }: any = require('./metricsConfig');
 const { allowsUnrated, hasAgeRatingCap }: any = require('../utils/ageRating');
 const {
   decodeCachePayload,
+  decodeCacheText,
   encodeCachePayload,
 }: any = require('./cacheCodec');
 const { readMetaHash, writeMetaHashReplace, writeMetaHashFill }: any = require('./metaHashStore');
+const { readHeldHash, readHeldAlias, readHeldPage, markUnsettled, forgetHeld, forgetAllHeld }: any = require('./metaMemory');
 const {
   canonicalizeLinksForCache,
   applyLinksUserScopeProjection,
@@ -21,6 +25,8 @@ const {
   applyImdbRatingProjectionToList,
 }: any = require('./imdbRatingProjection');
 const { applyTrailerAddonProjection }: any = require('./trailerProjection');
+const { applyAnimeEpisodeDatesProjection }: any = require('./animeEpisodeDates');
+const { applyAnimeFillerProjection }: any = require('./animeFillerProjection');
 const {
   RELEASE_AVAILABILITY_FIELD,
   normalizeMetaReleaseAvailability,
@@ -59,6 +65,7 @@ function parsePositiveIntEnv(envValue: any, defaultValue: number, minValue: numb
 
 const { withEpoch, withGlobalEpoch }: any = require('./cacheEpoch');
 const { clampTtlToWarmWindow }: any = require('./catalogWarmWindow');
+const { endPageTtlSeconds }: any = require('./catalogPagination');
 const { clampMetaTtlToAirWindow }: any = require('./metaAirWindow');
 const {
   isRefreshAheadEnabled,
@@ -156,6 +163,7 @@ function cloneJsonCompatibleResult(value: any): any {
 
 async function deleteKeysByPattern(pattern: string, options: any = {}): Promise<number> {
   if (!redis) return 0;
+  forgetAllHeld();
   const scanCount = options.scanCount || 1000;
   const batchSize = options.batchSize || 500;
   let cursor = '0';
@@ -176,6 +184,7 @@ async function deleteKeysByPattern(pattern: string, options: any = {}): Promise<
     }
   } while (cursor !== '0');
 
+  forgetAllHeld();
   return totalDeleted;
 }
 
@@ -446,6 +455,7 @@ function classifyResult(result: any, error: any = null, cacheKey: string | null 
     cacheKey.includes('anilist_') ||
     cacheKey.includes('kitsu-') ||
     cacheKey.includes('mdblist-') ||
+    cacheKey.includes('publicmetadb-api:') ||
     cacheKey.includes('trakt-') ||
     cacheKey.includes('trakt_') ||
     cacheKey.includes('mdblist_') ||
@@ -824,6 +834,7 @@ function getCatalogContentScope(idOnly: string, catalogType: string, config: any
   // Mixed, not series: the row can carry anime too, so the anime providers have to
   // reach the config hash or a provider change would serve stale episode numbers.
   if (idOnly === 'simkl.upnext') return 'mixed';
+  if (idOnly.startsWith('simkl.watchlist.all.')) return 'mixed';
 
   if (idOnly === 'mdblist.upnext') return 'series';
   if (idOnly === 'mdblist.watchlist') return 'mixed';
@@ -997,11 +1008,15 @@ function hashProfile(profile: any): string {
 }
 
 function getMetaSmartLockContextHash(config: any, metaId: string, type: string | null, includeVideos: boolean, useShowPoster: boolean): string {
+  const seasonNumbering = seasonNumberingProfile(config);
   return hashConfig({
     cacheContext: getMetaCacheContext(config, metaId, type, useShowPoster),
     projection: {
       blurThumbs: config.blurThumbs || false,
       displayAgeRating: config.displayAgeRating || false,
+      ...(config.animeEpisodeDates && config.animeEpisodeDates !== 'provider' ? { animeEpisodeDates: config.animeEpisodeDates } : {}),
+      ...(config.mal?.skipMixedFiller ? { skipMixedFiller: true } : {}),
+      ...(seasonNumbering ? { seasonNumbering } : {}),
     },
     includeVideos: !!includeVideos,
   });
@@ -1154,16 +1169,11 @@ function applyBlurThumbProjection(meta: any, config: any): any {
   return meta;
 }
 
-function stripCertificationLinks(links: any[], certification: string): any[] {
-  if (!Array.isArray(links) || !certification) return links;
-  return links.filter((link: any) => !(link?.name === certification && link?.category === 'Genres'));
-}
-
 function applyDisplayAgeRatingProjection(meta: any, config: any): any {
   const certification = meta?.app_extras?.certification;
-  if (!certification) return meta;
   const displayCert = meta?.app_extras?.certificationLocal || certification;
-  const links = Array.isArray(meta.links) ? stripCertificationLinks(meta.links, certification).filter((l: any) => !(l?.name === displayCert && l?.category === 'Genres')) : [];
+  if (!displayCert) return meta;
+  const links = Array.isArray(meta.links) ? stripRatingLinks(meta.links, meta.app_extras) : [];
   if (config.displayAgeRating) {
     const imdbId = meta.id?.match(/^tt\d+/)?.[0] || meta.imdb_id || meta._imdbId;
     const tmdbPath = meta.type === 'series' ? 'tv' : 'movie';
@@ -1175,6 +1185,28 @@ function applyDisplayAgeRatingProjection(meta: any, config: any): any {
     meta.links = links;
   }
   return meta;
+}
+
+// cacheWrap hands concurrent callers of one key the same payload, and the rating
+// country is per user, so each caller projects its own copy of the rows.
+function projectRatingsInPayload(result: any, config: any, includeRatingLink: boolean): any {
+  if (!Array.isArray(result?.metas) || result.metas.length === 0) return result;
+  const metas = result.metas.map((meta: any) => {
+    if (!meta || typeof meta !== 'object') return meta;
+    const own = meta.app_extras && typeof meta.app_extras === 'object'
+      ? { ...meta, app_extras: { ...meta.app_extras } }
+      : { ...meta };
+    applyContentRatingProjection(own, config);
+    return includeRatingLink || hasRatingLink(own) ? applyDisplayAgeRatingProjection(own, config) : own;
+  });
+  return { ...result, metas };
+}
+
+// A row built from a full meta already carries the building user's rating link.
+function hasRatingLink(meta: any): boolean {
+  if (!Array.isArray(meta?.links)) return false;
+  const names = ratingLinkNames(meta.app_extras);
+  return meta.links.some((link: any) => link?.category === 'Genres' && names.has(link?.name));
 }
 
 function getConfiguredCastCount(config: any): number | null {
@@ -1247,11 +1279,21 @@ async function projectMetaForUser(meta: any, config: any, opts: { addonTrailers?
   applyTrailerStreamsProjection(meta);
   if (opts.addonTrailers !== false) await applyTrailerAddonProjection(meta, config);
   applyCastCountProjection(meta, config);
+  applySeasonNumberingProjection(meta, config);
   applyBlurThumbProjection(meta, config);
+  applyContentRatingProjection(meta, config);
   applyDisplayAgeRatingProjection(meta, config);
   applyLinksUserScopeProjection(meta, config);
   await applyImdbRatingProjection(meta);
+  await applyAnimeEpisodeDatesProjection(meta, config);
+  await applyAnimeFillerProjection(meta, config);
+  stripVideoInternals(meta);
   return meta;
+}
+
+function stripVideoInternals(meta: any): void {
+  if (!Array.isArray(meta?.videos) || !meta.videos.some((video: any) => video?._tvdbEpisodeId != null)) return;
+  meta.videos = meta.videos.map(({ _tvdbEpisodeId, ...video }: any) => video);
 }
 
 const CATALOG_META_FIELDS = [
@@ -1309,6 +1351,7 @@ function projectAppExtrasForCatalogCache(appExtras: any): any {
     // dropping it made a cached row fall back to the US rating while the meta page
     // kept showing the user's own. Same title, two answers, on a cache hit only.
     'certificationLocal',
+    'certifications',
     'ratings',
     'releaseAvailability',
     'cast',
@@ -1324,6 +1367,8 @@ function projectAppExtrasForCatalogCache(appExtras: any): any {
       projected[field] = appExtras[field];
     }
   }
+  // Projected per user on read whenever the map is here.
+  if (projected.certifications) delete projected.certificationLocal;
 
   return Object.keys(projected).length > 0 ? projected : undefined;
 }
@@ -1392,6 +1437,9 @@ async function resolveConfigForCache(userUUID: string, options: any = {}): Promi
   }
   return config;
 }
+
+// Rows that carry episode ids (a linked next episode or a list of them), in the user's season numbering.
+const EPISODE_LINK_CATALOGS = new Set(['trakt.upnext', 'trakt.unwatched', 'simkl.upnext', 'simkl.upnext.anime', 'mdblist.upnext', 'publicmetadb.upnext']);
 
 async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: () => Promise<any>, options: any = {}): Promise<any> {
   let config: any;
@@ -1517,7 +1565,7 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       openrouterModel: config.recommendations?.openrouter_model || '',
       hasGemini: !!config.apiKeys?.gemini,
       hasOpenrouter: !!config.apiKeys?.openrouter,
-      sources: config.recommendations?.sources || '',
+      sources: require('../utils/recommendations/history').resolveSources(config).choice,
       // Every setting that moves the picks has to move the page as well.
       webSearch: config.recommendations?.web_search === true,
       reasoningEffort: config.recommendations?.reasoning_effort || '',
@@ -1536,6 +1584,11 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
 
   if (catalogFromConfig?.metadata?.useUpstreamArt === true) {
     catalogConfig.upstreamArt = true;
+  }
+
+  if (EPISODE_LINK_CATALOGS.has(idOnly)) {
+    const seasonNumbering = seasonNumberingProfile(config);
+    if (seasonNumbering) catalogConfig.seasonNumbering = seasonNumbering;
   }
 
   const catalogConfigString = JSON.stringify(catalogConfig);
@@ -1601,10 +1654,22 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     }
   }
 
+  if (idOnly.startsWith('aiom.watchlist.')) {
+    cacheTTL = 0;
+    cachingDisabled = true;
+  }
+
   if (isMergedCatalog) {
     cacheTTL = 0;
     cacheLogger.debug(`[Catalog] Skipping outer cache for merged catalog ${idOnly} (sources cache internally)`);
   }
+
+  // Rows built from one account's history or picks: equal settings must not share a page.
+  const isUserBuiltCatalog = idOnly.includes('stremthru.') || idOnly.startsWith('custom.') || idOnly.startsWith('letterboxd.')
+    || idOnly.startsWith('recommendations.');
+  const isRecommendationCatalog = idOnly.startsWith('recommendations.');
+  const recommendationViewer = isRecommendationCatalog ? require('../utils/recommendations/history').viewerKey(config, userUUID || '') : '';
+  const recommendationStamp = isRecommendationCatalog ? await require('../utils/recommendations/refresh').rowStamp(recommendationViewer) : '';
 
   let key: string;
   if (isAuthCatalog) {
@@ -1617,14 +1682,16 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     const day = String(now.getDate()).padStart(2, '0');
     const today = `${year}-${month}-${day}`;
     key = `catalog:${today}:${configHash}:${cacheTTL}:${catalogKey}`;
-  } else if (idOnly.includes('stremthru.') || idOnly.startsWith('custom.') || idOnly.startsWith('letterboxd.')) {
+  } else if (isRecommendationCatalog) {
+    key = `catalog:${recommendationViewer}${recommendationStamp ? `@${recommendationStamp}` : ''}:${configHash}:${cacheTTL}:${catalogKey}`;
+  } else if (isUserBuiltCatalog) {
     key = `catalog:${userUUID}:${configHash}:${cacheTTL}:${catalogKey}`;
   } else {
     key = `catalog:${configHash}:${cacheTTL}:${catalogKey}`;
   }
 
-  const isUserScopedCatalog = isAuthCatalog || idOnly.includes('stremthru.') || idOnly.startsWith('custom.') || idOnly.startsWith('letterboxd.');
-  const cacheKeyIdentifier = isAuthCatalog ? (config.sessionId || 'no-session') : (isUserScopedCatalog ? (userUUID || '') : '');
+  const isUserScopedCatalog = isAuthCatalog || isUserBuiltCatalog;
+  const cacheKeyIdentifier = isAuthCatalog ? (config.sessionId || 'no-session') : (isRecommendationCatalog ? recommendationViewer : (isUserScopedCatalog ? (userUUID || '') : ''));
   const catalogSig = shortSignature(`${cacheKeyIdentifier}|${idOnly}|${configHash}|ttl:${cacheTTL}`);
   cacheLogger.debug(`[Catalog] Key detail (${idOnly}) [sig:${catalogSig}] scope:${contentScope} userScoped:${isUserScopedCatalog} ttl:${cacheTTL}s catalogConfig:${catalogConfigShown} catalogKey:${catalogKey}`);
 
@@ -1659,6 +1726,17 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   if (writeTTL !== cacheTTL) {
     cacheLogger.debug(`[Catalog] Holding ${idOnly} to ${writeTTL}s so it lapses before the next warm run (configured ${cacheTTL}s)`);
   }
+  const classifyPage = options.resultClassifier || classifyResult;
+  const endTtl = Math.min(writeTTL, endPageTtlSeconds());
+  options = {
+    ...options,
+    resultClassifier: (result: any, error: any, cacheKey: string) => {
+      if (!error && result?.endOfList === true && Array.isArray(result.metas) && result.metas.length === 0) {
+        return { type: 'EMPTY_RESULT', ttl: endTtl };
+      }
+      return classifyPage(result, error, cacheKey);
+    },
+  };
 
   const result = cachingDisabled
     ? normalizeReleaseAvailabilityInPayload(await method())
@@ -1668,13 +1746,12 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   normalizeReleaseAvailabilityInPayload(result);
   normalizeCreditsInPayload(result);
 
-  if (result?.metas?.length) {
-    for (const meta of result.metas) applyDisplayAgeRatingProjection(meta, config);
-  }
+  const projected = projectRatingsInPayload(result, config, true);
+  if (projected && typeof projected === 'object') delete projected.endOfList;
 
-  await applyImdbRatingProjectionToList(result?.metas);
+  await applyImdbRatingProjectionToList(projected?.metas);
 
-  return result;
+  return projected;
   }
 
 async function cacheWrapSearch(userUUID: string, searchKey: string, method: () => Promise<any>, searchEngine: string | null = null, options: any = {}): Promise<any> {
@@ -1723,6 +1800,7 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
     showMetaProviderAttribution: config.showMetaProviderAttribution || false,
     displayAgeRating: config.displayAgeRating || false,
     useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false,
+    jikanEnabled: require('./mal').isJikanEnabled(),
     aiProvider: config.search?.ai_provider || 'gemini',
     aiModel: config.search?.ai_model || '',
     aiWebSearch: config.search?.ai_web_search || false,
@@ -1741,8 +1819,9 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
     return normalizeReleaseAvailabilityInPayload(await method());
   }, SEARCH_TTL, options);
   normalizeReleaseAvailabilityInPayload(result);
-  await applyImdbRatingProjectionToList(result?.metas);
-  return result;
+  const projected = projectRatingsInPayload(result, config, false);
+  await applyImdbRatingProjectionToList(projected?.metas);
+  return projected;
 }
 
 async function cacheWrapMeta(userUUID: string, metaId: string, method: () => Promise<any>, ttl: number = META_TTL(), options: any = {}, type: string | null = null): Promise<any> {
@@ -1891,13 +1970,13 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
   if (meta.landscapePoster) components.push({ name: 'landscapePoster', data: { landscapePoster: meta.landscapePoster } });
   if (meta.logo) components.push({ name: 'logo', data: { logo: meta.logo } });
   if (meta.videos && Array.isArray(meta.videos) && meta.videos.length > 0) {
-    components.push({ name: 'videos', data: { videos: canonicalizeVideosForCache(meta.videos), _metaProvider: meta._metaProvider } });
+    components.push({ name: 'videos', data: { videos: canonicalizeVideosForCache(meta.videos), _metaProvider: meta._metaProvider, _seasonNumbering: 1 } });
   }
   if (meta.app_extras?.cast?.length) components.push({ name: 'cast', data: { cast: meta.app_extras.cast } });
   if (meta.app_extras?.directors?.length) components.push({ name: 'director', data: { directors: meta.app_extras.directors } });
   if (meta.app_extras?.writers?.length) components.push({ name: 'writer', data: { writers: meta.app_extras.writers } });
   if (meta.links && Array.isArray(meta.links) && meta.links.length > 0) {
-    components.push({ name: 'links', data: { links: canonicalizeLinksForCache(stripCertificationLinks(meta.links, meta.app_extras?.certification)) } });
+    components.push({ name: 'links', data: { links: canonicalizeLinksForCache(stripRatingLinks(meta.links, meta.app_extras)) } });
   }
   if (meta.trailers?.length) components.push({ name: 'trailers', data: { trailers: meta.trailers } });
   const extrasForCache = projectAppExtrasForComponentCache(meta.app_extras);
@@ -1927,6 +2006,13 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
     [RELEASE_AVAILABILITY_FIELD]: meta[RELEASE_AVAILABILITY_FIELD],
     runtime: meta.runtime,
     country: meta.country,
+    tagline: meta.tagline,
+    studios: meta.studios,
+    networks: meta.networks,
+    countries: meta.countries,
+    airDays: meta.airDays,
+    airTime: meta.airTime,
+    _originalLanguage: meta._originalLanguage,
     status: meta.status,
     imdbRating: meta.imdbRating,
     behaviorHints: meta.behaviorHints,
@@ -1985,8 +2071,11 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
 async function readMetaAlias({ config, metaId, type = null, useShowPoster = false }: { config: any; metaId: string; type?: string | null; useShowPoster?: boolean }): Promise<string | null> {
   if (!redis) return null;
   try {
-    const aliased = await redis.get(withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster })));
-    return typeof aliased === 'string' && aliased ? aliased : null;
+    const key = withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster }));
+    return await readHeldAlias(key, async () => {
+      const aliased = await redis.get(key);
+      return typeof aliased === 'string' && aliased ? aliased : null;
+    });
   } catch (error: any) {
     cacheLogger.warn(`[Meta] Alias read failed for ${metaId}: ${error?.message}`);
     return null;
@@ -1995,8 +2084,10 @@ async function readMetaAlias({ config, metaId, type = null, useShowPoster = fals
 
 async function writeMetaAlias({ config, metaId, aliasTo, ttl = META_TTL(), type = null, useShowPoster = false }: { config: any; metaId: string; aliasTo: string; ttl?: number; type?: string | null; useShowPoster?: boolean }): Promise<void> {
   if (!redis || !metaId || !aliasTo || metaId === aliasTo) return;
+  const key = withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster }));
   try {
-    await redis.set(withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster })), aliasTo, 'EX', ttl);
+    await redis.set(key, aliasTo, 'EX', ttl);
+    forgetHeld(key);
   } catch (error: any) {
     cacheLogger.warn(`[Meta] Alias write failed for ${metaId} -> ${aliasTo}: ${error?.message}`);
   }
@@ -2030,11 +2121,23 @@ async function reconstructMetaFromComponents(userUUID: string, metaId: string, t
   });
 }
 
+async function readComponentTexts(hashKey: string, fields: string[]): Promise<{ texts: Array<string | null>; basicTtl: number }> {
+  return readHeldHash(hashKey, fields, async (wanted: string[]) => {
+    const read = await readMetaHash(hashKey, wanted);
+    const texts = await Promise.all(read.values.map((value: Buffer | null, index: number) =>
+      decodeCacheText(value).catch((error: any) => {
+        cacheLogger.warn(`Error decoding component ${wanted[index]} of ${hashKey}:`, error);
+        return null;
+      })));
+    return { texts, basicTtl: read.basicTtl };
+  });
+}
+
 async function readVideosComponent({ config, metaId, type, useShowPoster, hashKey, basicTtl }: { config: any; metaId: string; type: string | null; useShowPoster: boolean; hashKey: string; basicTtl: number }): Promise<any> {
   const { field, legacyKey } = buildMetaHashLayout({ config, metaId, type, useShowPoster }).fields.videos;
   try {
-    const read = await readMetaHash(hashKey, [field]);
-    if (read.values[0]) return await decodeCachePayload(read.values[0]);
+    const read = await readComponentTexts(hashKey, [field]);
+    if (read.texts[0]) return JSON.parse(read.texts[0]);
     const coldStore = require('./metaColdStore');
     if (!coldStore.isEnabled()) return null;
     const hit = (await coldStore.readThrough([legacyKey])).get(legacyKey);
@@ -2065,26 +2168,43 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
   let basicTtl = -2;
 
   try {
-    const read = await readMetaHash(hashKey, componentNames.map((componentName) => layout.fields[componentName].field));
+    const read = await readComponentTexts(hashKey, componentNames.map((componentName) => layout.fields[componentName].field));
     basicTtl = read.basicTtl;
-    componentResults = await Promise.all(componentNames.map(async (componentName: string, index: number) => {
-      const cached = read.values[index];
-      if (!cached) return { componentName, data: null };
+    componentResults = componentNames.map((componentName: string, index: number) => {
+      const text = read.texts[index];
+      if (!text) return { componentName, data: null };
       try {
-        return { componentName, data: await decodeCachePayload(cached) };
+        return { componentName, data: JSON.parse(text) };
       } catch (parseError: any) {
         cacheLogger.warn(`Error parsing component ${componentName}:`, parseError);
         return { componentName, data: null };
       }
-    }));
+    });
   } catch (error: any) {
     cacheLogger.warn(`Error reading meta hash for ${metaId}:`, error);
+  }
+
+  if (followAlias && !componentResults.find((result: any) => result.componentName === 'basic')?.data) {
+    const aliasedId = await readMetaAlias({ config, metaId, type, useShowPoster });
+    if (aliasedId && aliasedId !== metaId) {
+      return reconstructMetaFromComponentsWithConfig({
+        config,
+        metaId: aliasedId,
+        type,
+        includeVideos,
+        useShowPoster,
+        countColdStoreMiss,
+        followAlias: false,
+      });
+    }
   }
 
   try {
     const coldStore = require('./metaColdStore');
     if (coldStore.isEnabled()) {
-      const missing = componentResults.filter((result: any) => result.data === null);
+      const basicRead = componentResults.find((result: any) => result.componentName === 'basic')?.data;
+      const written = Array.isArray(basicRead?._components) ? new Set(['basic', ...basicRead._components]) : null;
+      const missing = componentResults.filter((result: any) => result.data === null && (!written || written.has(result.componentName)));
       if (missing.length > 0) {
         const found = await coldStore.readThrough(missing.map((result: any) => layout.fields[result.componentName].legacyKey));
         if (found.size > 0) {
@@ -2116,21 +2236,6 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
   // Every read needs basic, and nothing written for this profile outlives it,
   // so without it there is nothing to reconstruct here.
   if (!basicComponent) {
-    if (followAlias) {
-      const aliasedId = await readMetaAlias({ config, metaId, type, useShowPoster });
-      if (aliasedId && aliasedId !== metaId) {
-        return reconstructMetaFromComponentsWithConfig({
-          config,
-          metaId: aliasedId,
-          type,
-          includeVideos,
-          useShowPoster,
-          countColdStoreMiss,
-          followAlias: false,
-        });
-      }
-    }
-
     updateCacheHealth(`meta:reconstructed:${metaId}`, 'miss', true);
     return { errorReason: 'no cached components' };
   }
@@ -2144,6 +2249,10 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
     const index = availableComponents.findIndex((c: any) => c.componentName === 'videos');
     if (index >= 0) availableComponents.splice(index, 1);
     if (videos) availableComponents.push({ componentName: 'videos', data: videos });
+  }
+  if (includeVideos && predatesSeasonNumbering(bd, availableComponents.find((c: any) => c.componentName === 'videos')?.data, config)) {
+    updateCacheHealth(`meta:reconstructed:${metaId}`, 'miss', true);
+    return { errorReason: 'videos predate season numbering' };
   }
   Object.assign(reconstructedMeta, bd);
   delete reconstructedMeta._components;
@@ -2277,6 +2386,55 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
   return { meta: await projectMetaForUser(reconstructedMeta, config, { addonTrailers: includeVideos }) };
 }
 
+const CATALOG_VIEW_SKIPPED = new Set([
+  'userUUID',
+  'addonIdentifier',
+  'sessionId',
+  'configHash',
+  'lastModified',
+  'configVersion',
+  'catalogs',
+  'collections',
+  'collectionCatalogs',
+  'tags',
+  'managerAccounts',
+  'search',
+  'searchEnabled',
+  'recommendations',
+  'ai_catalog',
+  'timezone',
+  'catalogSetupComplete',
+  'addonName',
+  'showDisabledCatalogs',
+  'playbackReporting',
+  'showRateMeButton',
+]);
+const CATALOG_VIEW_SKIPPED_KEYS = new Set(['malTokenId', 'anilistTokenId', 'simklTokenId', 'traktTokenId', 'movieLensCredId', 'trakt', 'simkl', 'gemini', 'openrouter']);
+
+function catalogViewSignature(config: any): string {
+  const view: any = { enableRatingPosters: config._currentCatalogConfig?.enableRatingPosters ?? null };
+  for (const [field, value] of Object.entries(config)) {
+    if (CATALOG_VIEW_SKIPPED.has(field) || field.startsWith('_current') || field.startsWith('jellyfin') || field.startsWith('hideWatched') || field.endsWith('WatchTracking')) continue;
+    view[field] = field === 'apiKeys' && value && typeof value === 'object'
+      ? Object.fromEntries(Object.entries(value).filter(([name]) => !CATALOG_VIEW_SKIPPED_KEYS.has(name)))
+      : value;
+  }
+  return crypto.createHash('sha256').update(stableStringify(view)).digest('hex').slice(0, 32);
+}
+
+async function readCatalogItemsPage(config: any, items: any[], variant: string, build: () => Promise<any[]>): Promise<any[]> {
+  const itemsHash = crypto.createHash('sha256').update(JSON.stringify(items)).digest('hex').slice(0, 32);
+  const metas = await readHeldPage(`${catalogViewSignature(config)}:${variant}:${itemsHash}`, async () => {
+    const built = await build();
+    for (const meta of built) {
+      if (Array.isArray(meta?.links)) meta.links = canonicalizeLinksForCache(meta.links);
+    }
+    return built;
+  });
+  for (const meta of metas) applyLinksUserScopeProjection(meta, config);
+  return metas;
+}
+
 async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () => Promise<any>, ttl: number = META_TTL(), options: any = {}, type: string | null = null, includeVideos: boolean = true, useShowPoster: boolean = false): Promise<any> {
   cacheLogger.debug(`[Meta] Smart caching for ${metaId} (type:${type}, videos:${includeVideos}, showPoster:${useShowPoster})`);
 
@@ -2313,11 +2471,12 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
 
   const failureReason = reconstructedMeta && reconstructedMeta.errorReason ? ` (reason: ${reconstructedMeta.errorReason})` : '';
   cacheLogger.debug(`[Meta] Component reconstruction failed for ${metaId}${failureReason}`);
+  markUnsettled();
 
   const lockContextHash = getMetaSmartLockContextHash(config, metaId, type, includeVideos, useShowPoster);
   const lockKey = withEpoch(`meta-smart:${userUUID || 'global'}:${type || 'unknown'}:${lockContextHash}:videos=${includeVideos ? 1 : 0}:showPoster=${useShowPoster ? 1 : 0}:${metaId}`);
 
-  return singleFlight(lockKey, async () => {
+  const buildOwn = () => singleFlight(lockKey, async () => {
     const reconstructedAfterWait = await reconstructMetaFromComponentsWithConfig({
       config,
       metaId,
@@ -2347,6 +2506,10 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
     if (meta.__degradedFallback) {
       delete meta.__degradedFallback;
       cacheLogger.warn(`[Meta] Skipping cache for degraded fallback result: ${metaId}`);
+      applySeasonNumberingProjection(meta, config);
+      applyContentRatingProjection(meta, config);
+      applyDisplayAgeRatingProjection(meta, config);
+      stripVideoInternals(meta);
       return result;
     }
 
@@ -2380,6 +2543,35 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
       authoritative: includeVideos,
     });
   }, cloneJsonCompatibleResult);
+
+  const buildKey = metaBuildKey(config, metaId, type, includeVideos, useShowPoster);
+  if (!inFlightRequests.has(buildKey)) return singleFlight(buildKey, buildOwn);
+  await singleFlight(buildKey, buildOwn).catch(() => null);
+
+  const afterShared = await reconstructMetaFromComponentsWithConfig({
+    config,
+    metaId,
+    type,
+    includeVideos,
+    useShowPoster,
+    countColdStoreMiss: false,
+  });
+  if (afterShared && afterShared.meta) {
+    cacheLogger.debug(`[Meta] Component reconstruction successful after a shared build for ${metaId}`);
+    return afterShared;
+  }
+  return buildOwn();
+}
+
+function metaBuildKey(config: any, metaId: string, type: string | null, includeVideos: boolean, useShowPoster: boolean): string {
+  const layout = buildMetaHashLayout({ config, metaId, type, useShowPoster });
+  const fields = Object.entries(layout.fields)
+    .filter(([name]) => includeVideos || name !== 'videos')
+    .map(([, { field }]) => field)
+    .sort();
+  const identity = [layout.key, buildMetaAliasCacheKey({ config, metaId, type, useShowPoster }), ...fields].join('|');
+  const digest = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 32);
+  return withEpoch(`meta-build:${type || 'unknown'}:${digest}:videos=${includeVideos ? 1 : 0}:showPoster=${useShowPoster ? 1 : 0}:${metaId}`);
 }
 
 /** The upstream image behind a rating-poster or proxy URL, which is what a component stores. */
@@ -2422,7 +2614,7 @@ async function fillArtComponents(config: any, metaId: string, basic: any, wanted
 
   let art: any;
   try {
-    art = await resolveArtworkForProfile({ type: basic.type, ids, metaProvider: basic._metaProvider, providerArt: basic._providerArt }, config);
+    art = await resolveArtworkForProfile({ type: basic.type, ids, metaProvider: basic._metaProvider, providerArt: basic._providerArt, wanted }, config);
   } catch (error: any) {
     cacheLogger.warn(`[Reconstruct] Art lookup failed for ${metaId}: ${error?.message || error}`);
     return [];
@@ -2645,6 +2837,7 @@ export {
   redis,
   cacheWrap,
   cacheWrapGlobal,
+  classifyResult,
   classifyResultAllowEmpty,
   deleteKeysByPattern,
   scanKeys,
@@ -2665,7 +2858,10 @@ export {
   buildMetaAliasCacheKey,
   projectMetaForCatalogCache,
   projectCatalogPayloadForCache,
+  applyDisplayAgeRatingProjection,
+  projectRatingsInPayload,
   cacheWrapMetaSmart,
+  readCatalogItemsPage,
   getCacheHealth,
   clearCacheHealth,
   clearCache,
@@ -2682,6 +2878,7 @@ module.exports = {
   redis,
   cacheWrap,
   cacheWrapGlobal,
+  classifyResult,
   classifyResultAllowEmpty,
   deleteKeysByPattern,
   scanKeys,
@@ -2702,7 +2899,10 @@ module.exports = {
   buildMetaAliasCacheKey,
   projectMetaForCatalogCache,
   projectCatalogPayloadForCache,
+  applyDisplayAgeRatingProjection,
+  projectRatingsInPayload,
   cacheWrapMetaSmart,
+  readCatalogItemsPage,
   getCacheHealth,
   clearCacheHealth,
   clearCache,

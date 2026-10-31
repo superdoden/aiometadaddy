@@ -168,6 +168,18 @@ async function syncSimkl(key: string, tokenId: string, config: any, watermark: a
 // --- MDBList ------------------------------------------------------------------------
 
 const MDBLIST_WATCH_FIELDS = ['watched_at', 'season_watched_at', 'episode_watched_at', 'journal_at'];
+const MDBLIST_MIRROR_FORMAT = 4;
+const MDBLIST_OLD_LIMIT = 50_000;
+const PMDB_OLD_LIMIT = 25_000;
+
+async function heldByKind(key: string): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  for (const row of await database.listTrackerMirrorKeys(key)) {
+    const kind = String(row.item_key).split(':')[0];
+    out.set(kind, (out.get(kind) ?? 0) + 1);
+  }
+  return out;
+}
 
 function mdblistMovieRow(entry: any): MirrorRow | null {
   const id = entry?.movie?.ids?.mdblist;
@@ -182,7 +194,7 @@ function mdblistEpisodeRow(entry: any): MirrorRow | null {
   return { key: `ep:${show}:${season}:${number}`, group: `show:${show}`, sub: String(season), data: entry };
 }
 
-// A watched show, for its aired episode count; filed with its episodes so a removal takes it too.
+// A watched show, for its aired episode count.
 function mdblistShowRow(entry: any): MirrorRow | null {
   const id = entry?.show?.ids?.mdblist;
   return id ? { key: `showinfo:${id}`, group: `show:${id}`, data: entry } : null;
@@ -223,13 +235,76 @@ async function mdblistFull(key: string, apiKey: string, activities: any): Promis
     { key: 'dropped', data: dropped },
   ] as MirrorRow[];
   await replaceMirror(key, rows, () => true);
-  return { changed: true, watermark: { ...activities, ...(await mdblistUpNextMark(apiKey)) }, full: true };
+  return { changed: true, watermark: { ...activities, ...(await mdblistUpNextMark(apiKey)), format: MDBLIST_MIRROR_FORMAT }, full: true };
+}
+
+async function mdblistCutShort(key: string, apiKey: string, watermark: any): Promise<'whole' | 'read' | 'later'> {
+  if (Number(watermark.healAfter) > Date.now()) return 'later';
+  const held = await heldByKind(key);
+  const kinds = ['movie', 'ep', 'showinfo'];
+  if (!kinds.some((kind) => (held.get(kind) ?? 0) >= MDBLIST_OLD_LIMIT)) return 'whole';
+  const pages = kinds.reduce((sum, kind) => sum + Math.ceil((held.get(kind) ?? 0) / 1000) + 1, 5);
+  const { remaining, limit } = require('../../utils/mdbList').mdblistCallsLeft(apiKey);
+  return remaining === null || remaining - pages >= Math.max(50, (limit ?? 0) / 5) ? 'read' : 'later';
+}
+
+const later = (a: unknown, b: unknown): unknown => (String(a ?? '') > String(b ?? '') ? a : b);
+
+async function journalRows(key: string, rows: any[]): Promise<MirrorRow[]> {
+  const groups = new Map<string, Map<string, any>>();
+  const heldIn = async (group: string): Promise<Map<string, any>> => {
+    if (!groups.has(group)) {
+      const held = new Map<string, any>();
+      for (const row of (await database.listTrackerMirrorGroup(key, group).catch(() => [])) as any[]) {
+        try {
+          held.set(String(row.item_key), JSON.parse(row.data));
+        } catch {}
+      }
+      groups.set(group, held);
+    }
+    return groups.get(group)!;
+  };
+  const out: MirrorRow[] = [];
+  for (const row of rows) {
+    const id = row?.ids?.mdblist;
+    if (!id) continue;
+    if (row.item_type === 'movie') {
+      const group = `movie:${id}`;
+      const existing = (await heldIn(group)).get(group);
+      out.push({ key: group, group, data: existing ? { ...existing, last_watched_at: later(existing.last_watched_at, row.value_at) } : { movie: { ids: row.ids }, last_watched_at: row.value_at } });
+      continue;
+    }
+    const group = `show:${id}`;
+    const itemKey = `ep:${id}:${row.season}:${row.episode}`;
+    const existing = (await heldIn(group)).get(itemKey);
+    out.push({
+      key: itemKey,
+      group,
+      sub: String(row.season),
+      data: existing ? { ...existing, last_watched_at: later(existing.last_watched_at, row.value_at) } : { episode: { show: { ids: row.ids }, season: row.season, number: row.episode }, last_watched_at: row.value_at },
+    });
+  }
+  return out;
 }
 
 async function syncMdblist(key: string, apiKey: string, watermark: any): Promise<SyncOutcome> {
   const activities = await mdblistActivities(apiKey);
   if (!activities?.server_time) throw new Error('MDBList activities could not be read');
-  if (!watermark?.server_time) return mdblistFull(key, apiKey, activities);
+  if (watermark?.server_time && watermark.format === 3) {
+    const verdict = await mdblistCutShort(key, apiKey, watermark);
+    if (verdict === 'read') {
+      try {
+        return await mdblistFull(key, apiKey, activities);
+      } catch (error: any) {
+        logger.warn(`MDBList full read for ${key} stopped, trying again after its quota resets: ${error?.message || error}`);
+      }
+    }
+    watermark = verdict === 'whole'
+      ? { ...watermark, format: MDBLIST_MIRROR_FORMAT }
+      : { ...watermark, healAfter: Number(watermark.healAfter) > Date.now() ? watermark.healAfter : require('../../utils/mdbList').mdblistCallsLeft(apiKey).resetAt };
+  }
+  if (!watermark?.server_time || (watermark.format !== MDBLIST_MIRROR_FORMAT && watermark.format !== 3)) return mdblistFull(key, apiKey, activities);
+  const kept = { format: watermark.format, healAfter: watermark.healAfter };
 
   const moved = (field: string) => (activities?.[field] ?? '') !== (watermark?.[field] ?? '');
   const watched = MDBLIST_WATCH_FIELDS.some(moved);
@@ -246,11 +321,13 @@ async function syncMdblist(key: string, apiKey: string, watermark: any): Promise
   if (watched) {
     // The journal holds each item's latest state, removals included; replayed from the
     // last sync, it says what left. What arrived is read whole from the history, whose
-    // since filters on the watch date, so a watch dated before the last sync needs a full read.
+    // since filters on the watch date, so a watch dated before the last sync is taken from its journal row.
     const removals: any[] = [];
-    let backdated = false;
+    const backdated: any[] = [];
+    let arrived = 0;
     let cursor = '';
-    for (let page = 0; page < envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1); page += 1) {
+    const read = new Set<string>();
+    for (;;) {
       const query = cursor
         ? `cursor=${encodeURIComponent(cursor)}`
         : `since=${encodeURIComponent(watermark.server_time)}`;
@@ -260,39 +337,49 @@ async function syncMdblist(key: string, apiKey: string, watermark: any): Promise
       if (body?.requires_full_sync) return mdblistFull(key, apiKey, activities);
       for (const row of Array.isArray(body?.journal) ? body.journal : []) {
         if (row?.category === 'watched' && row?.status === 'removed') removals.push(row);
-        if (row?.category === 'watched' && row?.status === 'added' && row?.value_at && row.value_at < watermark.server_time) backdated = true;
+        if (row?.category === 'watched' && row?.status === 'added' && row?.value_at && row.value_at < watermark.server_time) backdated.push(row);
+        else if (row?.category === 'watched' && row?.status === 'added') arrived += 1;
       }
       cursor = body?.pagination?.next_cursor ?? '';
       if (!cursor) break;
+      if (read.has(cursor)) {
+        logger.warn(`MDBList journal for ${key} repeated a page; reading it in full instead`);
+        return mdblistFull(key, apiKey, activities);
+      }
+      read.add(cursor);
     }
-    if (backdated) return mdblistFull(key, apiKey, activities);
+    if (backdated.some((row) => row?.item_type !== 'episode' && row?.item_type !== 'movie')) return mdblistFull(key, apiKey, activities);
+    if (backdated.length) await database.upsertTrackerMirror(key, await journalRows(key, backdated));
 
+    // A season or show is journaled as removed when it stops being complete.
     for (const row of removals) {
       const show = row?.ids?.mdblist;
       if (!show) continue;
       if (row.item_type === 'movie') await database.deleteTrackerMirror(key, [`movie:${show}`]);
       else if (row.item_type === 'episode') await database.deleteTrackerMirror(key, [`ep:${show}:${row.season}:${row.episode}`]);
-      else if (row.item_type === 'season') await database.deleteTrackerMirrorGroup(key, `show:${show}`, String(row.season));
-      else if (row.item_type === 'show') await database.deleteTrackerMirrorGroup(key, `show:${show}`);
     }
 
-    const { fetchMdblistWatched, fetchMdblistUpNext } = require('./watched');
-    const movies = await fetchMdblistWatched(apiKey, 'movie', watermark.server_time);
-    const episodes = await fetchMdblistWatched(apiKey, 'episode', watermark.server_time);
-    const shows = await fetchMdblistWatched(apiKey, 'show', watermark.server_time);
-    const rows = [...movies.map(mdblistMovieRow), ...episodes.map(mdblistEpisodeRow), ...shows.map(mdblistShowRow)].filter(Boolean) as MirrorRow[];
-    if (rows.length) await database.upsertTrackerMirror(key, rows);
-    // MDBList works out what is next itself; it moves with any watch.
-    await database.upsertTrackerMirror(key, [{ key: 'upnext', data: await fetchMdblistUpNext(apiKey) }]);
+    if (arrived) {
+      const { fetchMdblistWatched } = require('./watched');
+      const movies = await fetchMdblistWatched(apiKey, 'movie', watermark.server_time);
+      const episodes = await fetchMdblistWatched(apiKey, 'episode', watermark.server_time);
+      const shows = await fetchMdblistWatched(apiKey, 'show', watermark.server_time);
+      const rows = [...movies.map(mdblistMovieRow), ...episodes.map(mdblistEpisodeRow), ...shows.map(mdblistShowRow)].filter(Boolean) as MirrorRow[];
+      if (rows.length) await database.upsertTrackerMirror(key, rows);
+    }
   }
   if (dropped) {
     const { fetchMdblistDropped } = require('./watched');
     await database.upsertTrackerMirror(key, [{ key: 'dropped', data: await fetchMdblistDropped(apiKey) }]);
   }
-  const upNextMark = watched
+  // MDBList works out what is next itself and leaves dropped shows out; it moves with any watch or drop.
+  const { fetchMdblistUpNext } = require('./watched');
+  const upNext = await fetchMdblistUpNext(apiKey);
+  if (upNext.length || watched) await database.upsertTrackerMirror(key, [{ key: 'upnext', data: upNext }]);
+  const upNextMark = watched || dropped
     ? await mdblistUpNextMark(apiKey)
     : { upnext_at: watermark?.upnext_at ?? 0, upnext_next: watermark?.upnext_next ?? null };
-  return { changed: true, watermark: { ...activities, ...upNextMark }, full: false };
+  return { changed: true, watermark: { ...activities, ...upNextMark, ...kept }, full: false };
 }
 
 // --- PublicMetaDB -------------------------------------------------------------------
@@ -338,13 +425,12 @@ function pmdbPlayRow(row: any): MirrorRow | null {
 
 async function pmdbAllPlays(key: string, apiKey: string): Promise<void> {
   const { fetchWatched } = require('../../utils/publicmetadbUtils');
-  const rows: MirrorRow[] = [];
-  for (let page = 1; page <= envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1); page += 1) {
-    const result = await fetchWatched(apiKey, page, 500);
-    rows.push(...(result.items.map(pmdbPlayRow).filter(Boolean) as MirrorRow[]));
-    if (page >= result.totalPages || !result.items.length) break;
-  }
-  await replaceMirror(key, rows, (itemKey) => itemKey.startsWith('play:'));
+  const { readToEnd } = require('../../utils/readToEnd');
+  const plays = await readToEnd('PublicMetaDB plays', async (page: number) => {
+    const result = await fetchWatched(apiKey, page + 1, 500);
+    return { items: result.items, more: page + 1 < result.totalPages };
+  }, (play: any) => String(play?.id));
+  await replaceMirror(key, plays.map(pmdbPlayRow).filter(Boolean) as MirrorRow[], (itemKey) => itemKey.startsWith('play:'));
 }
 
 async function syncPmdb(key: string, apiKey: string, watermark: any): Promise<SyncOutcome> {
@@ -355,7 +441,21 @@ async function syncPmdb(key: string, apiKey: string, watermark: any): Promise<Sy
   if (!watermark?.head) {
     await pmdbAllPlays(key, apiKey);
     await database.upsertTrackerMirror(key, [{ key: 'dropped', data: await fetchPmdbDropped(apiKey) }]);
-    return { changed: true, watermark: { head: headValue }, full: true };
+    return { changed: true, watermark: { head: headValue, whole: true }, full: true };
+  }
+  if (!watermark.whole && !(Number(watermark.healAfter) > Date.now())) {
+    const plays = (await heldByKind(key)).get('play') ?? 0;
+    if (plays >= PMDB_OLD_LIMIT && plays !== head.total) {
+      try {
+        await pmdbAllPlays(key, apiKey);
+        return { changed: true, watermark: { head: headValue, whole: true }, full: true };
+      } catch (error: any) {
+        logger.warn(`PublicMetaDB full read for ${key} stopped, trying again later: ${error?.message || error}`);
+        watermark = { ...watermark, healAfter: Date.now() + 6 * 60 * 60 * 1000 };
+      }
+    } else {
+      watermark = { ...watermark, whole: true };
+    }
   }
   if (headValue === watermark.head) return { changed: false, watermark, full: false };
 
@@ -365,15 +465,17 @@ async function syncPmdb(key: string, apiKey: string, watermark: any): Promise<Sy
     const { fetchWatched } = require('../../utils/publicmetadbUtils');
     const fresh: MirrorRow[] = [];
     let reachedKnown = false;
-    for (let page = 1; page <= envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1) && !reachedKnown; page += 1) {
+    const taken = new Set<string>();
+    for (let page = 1; !reachedKnown; page += 1) {
       const result = await fetchWatched(apiKey, page, 100);
       const rows = result.items.map(pmdbPlayRow).filter(Boolean) as MirrorRow[];
       const held = await database.hasTrackerMirrorKeys(key, rows.map((row) => row.key));
       for (const row of rows) {
-        if (held.has(row.key)) {
+        if (held.has(row.key) || taken.has(row.key)) {
           reachedKnown = true;
           break;
         }
+        taken.add(row.key);
         fresh.push(row);
       }
       if (page >= result.totalPages || !result.items.length) break;
@@ -390,7 +492,7 @@ async function syncPmdb(key: string, apiKey: string, watermark: any): Promise<Sy
   if (head.droppedTotal !== before.droppedTotal) {
     await database.upsertTrackerMirror(key, [{ key: 'dropped', data: await fetchPmdbDropped(apiKey) }]);
   }
-  return { changed: true, watermark: { head: headValue }, full };
+  return { changed: true, watermark: { head: headValue, whole: true }, full };
 }
 
 // --- AniList and MyAnimeList --------------------------------------------------------

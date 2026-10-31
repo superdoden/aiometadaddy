@@ -1,5 +1,6 @@
+import { useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
-import { EpisodeOrderOverrides } from '@/components/settings/EpisodeOrderOverrides';
+import { TvdbShowSettings } from '@/components/settings/TvdbShowSettings';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -44,6 +45,12 @@ const animeIdProviders: SelectableOption[] = [
   { value: 'retain', label: 'Retain Requested ID (Auto-detect)' },
 ];
 
+const animeEpisodeDateSources: SelectableOption[] = [
+  { value: 'provider', label: 'Metadata provider' },
+  { value: 'earliest', label: 'Earliest release' },
+  { value: 'dub', label: 'English dub' },
+];
+
 const tvdbSeasonTypes: SelectableOption[] = [
   { value: 'official', label: 'Official Order' },
   { value: 'default', label: 'Aired Order (Default)' },
@@ -56,8 +63,13 @@ const tvdbSeasonTypes: SelectableOption[] = [
 ];
 
 export function ProvidersSettings() {
-  const { config, setConfig, hasBuiltInTvdb } = useConfig();
+  const { config, setConfig, hasBuiltInTvdb, jikanEnabled } = useConfig();
   const isImdbForCatalog = !!config.mal?.useImdbIdForCatalogAndSearch;
+
+  useEffect(() => {
+    if (jikanEnabled || config.providers.anime !== 'mal') return;
+    setConfig(prev => ({ ...prev, providers: { ...prev.providers, anime: 'kitsu' } }));
+  }, [jikanEnabled, config.providers.anime]);
   const hasTvdbKey = !!config.apiKeys?.tvdb?.trim() || hasBuiltInTvdb;
 
   const handleProviderChange = (type: 'movie' | 'series' | 'anime', value: string) => {
@@ -68,7 +80,7 @@ export function ProvidersSettings() {
     setConfig(prev => ({ ...prev, tvdbSeasonType: value }));
   };
 
-  const handleMalToggle = (key: 'skipFiller' | 'skipRecap' | 'allowEpisodeMarking', checked: boolean) => {
+  const handleMalToggle = (key: 'skipFiller' | 'skipMixedFiller' | 'skipRecap' | 'allowEpisodeMarking', checked: boolean) => {
     setConfig(prev => ({
       ...prev,
       mal: {
@@ -178,7 +190,7 @@ export function ProvidersSettings() {
               onValueChange={(val) => handleProviderChange('anime', val)}
               options={isImdbForCatalog
                 ? animeProviders.filter(p => p.value !== 'mal' && p.value !== 'kitsu')
-                : animeProviders}
+                : animeProviders.filter(p => p.value !== 'mal' || jikanEnabled)}
               hasTvdbKey={hasTvdbKey}
             />
             {isImdbForCatalog && (
@@ -222,7 +234,7 @@ export function ProvidersSettings() {
       {/* TVDB Specific Settings */}
       <CollapsibleSettingCard
         title="TheTVDB Settings"
-        anchorIds={['tvdb-season-order']}
+        anchorIds={['tvdb-season-order', 'tvdb-normalize-year-seasons']}
         inUse={isInUse(config, 'tvdb')}
         description={hasTvdbKey
           ? 'Customize how episode data is fetched from TheTVDB.'
@@ -245,12 +257,25 @@ export function ProvidersSettings() {
             />
           }
         />
+        <SettingRow
+          htmlFor="tvdb-normalize-year-seasons"
+          label="Normalize Year Seasons"
+          description="Number year-based seasons 1, 2, 3… instead of TVDB's years (S2014). Changes those shows' episode ids, so turn it off only if your stream sources number them by year."
+          control={
+            <Switch
+              id="tvdb-normalize-year-seasons"
+              checked={config.tvdbNormalizeYearSeasons !== false}
+              onCheckedChange={(val) => setConfig(prev => ({ ...prev, tvdbNormalizeYearSeasons: val }))}
+              disabled={!hasTvdbKey}
+            />
+          }
+        />
         <div className="space-y-2 pt-2">
-          <p className="text-sm font-medium">Per-show Episode Order</p>
+          <p className="text-sm font-medium">Per-show settings</p>
           <p className="text-sm text-muted-foreground">
-            Enter a show's TVDB id to give it its own episode order instead of the Season Order above.
+            Enter a show's TVDB id to give it its own episode order or season numbering.
           </p>
-          <EpisodeOrderOverrides disabled={!hasTvdbKey} />
+          <TvdbShowSettings disabled={!hasTvdbKey} />
         </div>
       </CollapsibleSettingCard>
 
@@ -343,6 +368,81 @@ export function ProvidersSettings() {
               </p>
             }
           />
+          <SettingRow
+            htmlFor="anime-episode-dates"
+            label="Anime Episode Dates"
+            description="When an anime episode counts as out. Earliest release uses the first release anywhere, which is often a streaming premiere days before the TV broadcast; English dub uses the dub's release. Episodes without a schedule keep the provider's date."
+            control={
+              <ProviderSelect
+                id="anime-episode-dates"
+                ariaLabel="Anime episode dates"
+                value={config.animeEpisodeDates || 'provider'}
+                onValueChange={(value) => setConfig(prev => ({ ...prev, animeEpisodeDates: value as 'provider' | 'earliest' | 'dub' }))}
+                options={animeEpisodeDateSources}
+                hasTvdbKey={hasTvdbKey}
+                className="w-full sm:w-[240px]"
+              />
+            }
+            note={
+              <p className="text-xs text-muted-foreground">
+                Release times from <a href="https://anilist.co" target="_blank" rel="noopener noreferrer" className="underline">AniList</a>; dub times from <a href="https://animeschedule.net" target="_blank" rel="noopener noreferrer" className="underline">AnimeSchedule.net</a>, via <a href="https://github.com/RockinChaos/AniSchedule" target="_blank" rel="noopener noreferrer" className="underline">AniSchedule</a>.
+              </p>
+            }
+          />
+          <SettingRow
+            htmlFor="skip-filler"
+            label="Skip Filler Episodes"
+            description="Leave out filler episodes."
+            control={
+              <Switch
+                id="skip-filler"
+                checked={!!config.mal.skipFiller}
+                onCheckedChange={(val) => handleMalToggle('skipFiller', val)}
+              />
+            }
+          />
+          <SettingRow
+            htmlFor="skip-mixed-filler"
+            label="Also Skip Mixed Canon/Filler"
+            description="Leave out episodes that mix canon with filler as well."
+            control={
+              <Switch
+                id="skip-mixed-filler"
+                checked={!!config.mal.skipFiller && !!config.mal.skipMixedFiller}
+                disabled={!config.mal.skipFiller}
+                onCheckedChange={(val) => handleMalToggle('skipMixedFiller', val)}
+              />
+            }
+          />
+          <SettingRow
+            htmlFor="skip-recap"
+            label="Skip Recap Episodes"
+            description="Leave out recap episodes."
+            control={
+              <Switch
+                id="skip-recap"
+                checked={!!config.mal.skipRecap}
+                onCheckedChange={(val) => handleMalToggle('skipRecap', val)}
+              />
+            }
+          />
+          <SettingRow
+            htmlFor="allow-episode-marking"
+            label="Mark Filler and Recap Episodes"
+            description="Put [Filler], [Mixed] or [Recap] in front of the episode title."
+            control={
+              <Switch
+                id="allow-episode-marking"
+                checked={!!config.mal.allowEpisodeMarking}
+                onCheckedChange={(val) => handleMalToggle('allowEpisodeMarking', val)}
+              />
+            }
+            note={
+              <p className="text-xs text-muted-foreground">
+                Episode types from <a href="https://www.animefillerlist.com" target="_blank" rel="noopener noreferrer" className="underline">animefillerlist.com</a>; recaps from <a href="https://myanimelist.net" target="_blank" rel="noopener noreferrer" className="underline">MyAnimeList</a>.
+              </p>
+            }
+          />
           {/*
             Bottom, not top: these notices describe the rows above them, and a
             summary that precedes what it summarises reads as an error banner.
@@ -357,50 +457,6 @@ export function ProvidersSettings() {
         </CardContent>
       </Card>
 
-      {/* MyAnimeList Specific Settings */}
-      <CollapsibleSettingCard
-        title="MyAnimeList (MAL) Settings"
-        anchorIds={['skip-filler', 'skip-recap', 'allow-episode-marking']}
-        inUse={isInUse(config, 'mal')}
-        description="Customize how data is handled when MyAnimeList is the source."
-      >
-        <SettingRow
-          htmlFor="skip-filler"
-          label="Skip Filler Episodes"
-          description="Automatically filter out episodes marked as filler."
-          control={
-            <Switch
-              id="skip-filler"
-              checked={config.mal.skipFiller}
-              onCheckedChange={(val) => handleMalToggle('skipFiller', val)}
-            />
-          }
-        />
-        <SettingRow
-          htmlFor="skip-recap"
-          label="Skip Recap Episodes"
-          description="Automatically filter out episodes marked as recaps."
-          control={
-            <Switch
-              id="skip-recap"
-              checked={config.mal.skipRecap}
-              onCheckedChange={(val) => handleMalToggle('skipRecap', val)}
-            />
-          }
-        />
-        <SettingRow
-          htmlFor="allow-episode-marking"
-          label="Allow Episode Marking"
-          description="Enable users to mark episodes as filler or recap."
-          control={
-            <Switch
-              id="allow-episode-marking"
-              checked={config.mal.allowEpisodeMarking}
-              onCheckedChange={(val) => handleMalToggle('allowEpisodeMarking', val)}
-            />
-          }
-        />
-      </CollapsibleSettingCard>
     </div>
   );
 }

@@ -21,6 +21,7 @@ import { keyStatuses } from "@/lib/configStatus";
 import { Callout } from "@/components/settings/Callout";
 import { ConfigStatusPanel, CONFIG_STATUS_SUMMARY_ID } from "@/components/settings/ConfigStatusPanel";
 import { SettingRow } from "@/components/settings/SettingRow";
+import { taggedManifestUrl } from "@/lib/managerAccounts";
 
 interface SavedConfig {
   userUUID: string;
@@ -290,13 +291,10 @@ export function ConfigurationManager() {
     };
   }, [selectedTags, profileTags]);
 
-  // One tag per param. A tag name can hold any character, so a separator would be
-  // ambiguous for the addon to split back apart.
   const taggedInstallUrl = useMemo(() => {
     if (!identity) return "";
-    const params = selectedTags.map(name => `tag=${encodeURIComponent(name)}`);
-    if (params.length === 0) return identity.installUrl;
-    return `${identity.installUrl}?${params.join('&')}`;
+    if (selectedTags.length === 0) return identity.installUrl;
+    return taggedManifestUrl(identity.installUrl, selectedTags);
   }, [identity, selectedTags]);
 
   const [jellyfinEnabled, setJellyfinEnabled] = useState(false);
@@ -377,8 +375,8 @@ export function ConfigurationManager() {
 
             <SettingRow
               htmlFor="collection-catalogs"
-              label="Collections as Catalogs"
-              description="Adds the collections you build to the manifest, for apps that show collections, such as AIOStreams. Apps that don't list them among their catalogs, for example under Discover. Jellyfin shows them as box sets either way."
+              label="Collections and More Like This as Catalogs"
+              description="Adds the collections you build, and a More Like This catalog of a title's similar titles, to the manifest for apps that use them, such as AIOStreams. Apps that don't list them among their catalogs, for example under Discover. Jellyfin shows collections as box sets and fills its own More Like This either way."
               control={
                 <Switch
                   id="collection-catalogs"
@@ -394,7 +392,7 @@ export function ConfigurationManager() {
               }
               note={config.catalogModeOnly ? (
                 <Callout variant="info">
-                  Catalog Mode Only already leaves collections out.
+                  Catalog Mode Only already leaves both out.
                 </Callout>
               ) : null}
             />

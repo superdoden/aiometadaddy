@@ -207,6 +207,7 @@ async function makeTmdbRequest(endpoint: string, apiKey: string, params: Record<
 
       // Handle 429 specifically with backoff
       if (response.status === 429) {
+          await response.body?.cancel().catch(() => undefined);
           const retryAfterHeader = response.headers.get('retry-after');
           const retryAfter = parseInt(retryAfterHeader || '5', 10);
           const waitTime = retryAfter * 1000 + 50; // Add buffer
@@ -223,6 +224,7 @@ async function makeTmdbRequest(endpoint: string, apiKey: string, params: Record<
         if (NON_RETRYABLE_CODES.has(response.status)) {
              // Special handling for 404 - return null/empty instead of throwing if expected
              if (response.status === 404) {
+                 await response.body?.cancel().catch(() => undefined);
                  consola.warn(`[TMDB] Resource not found for ${endpoint}`);
                  return null;
              }
@@ -633,7 +635,7 @@ export async function personInfo(params: any, config: UserConfig) {
 export async function personMovieCredits(params: any, config: UserConfig) {
   const { id, ...queryParams } = params;
   const normalizedQueryParams = normalizeTmdbCacheQueryParams(queryParams);
-  const cacheKey = `tmdb:person:movie_credits:${id}${getTmdbQueryCacheSuffix(normalizedQueryParams)}`;
+  const cacheKey = `tmdb:person:movie_credits:v2:${id}${getTmdbQueryCacheSuffix(normalizedQueryParams)}`;
   return cacheWrapGlobal(cacheKey, () =>
     makeTmdbRequest(`/person/${id}/movie_credits`, getApiKey(config), normalizedQueryParams, 'GET', null, config)
       .then(normalizeTmdbPersonCreditsForCache),
@@ -644,7 +646,7 @@ export async function personMovieCredits(params: any, config: UserConfig) {
 export async function personTvCredits(params: any, config: UserConfig) {
   const { id, ...queryParams } = params;
   const normalizedQueryParams = normalizeTmdbCacheQueryParams(queryParams);
-  const cacheKey = `tmdb:person:tv_credits:${id}${getTmdbQueryCacheSuffix(normalizedQueryParams)}`;
+  const cacheKey = `tmdb:person:tv_credits:v2:${id}${getTmdbQueryCacheSuffix(normalizedQueryParams)}`;
   return cacheWrapGlobal(cacheKey, () =>
     makeTmdbRequest(`/person/${id}/tv_credits`, getApiKey(config), normalizedQueryParams, 'GET', null, config)
       .then(normalizeTmdbPersonCreditsForCache),

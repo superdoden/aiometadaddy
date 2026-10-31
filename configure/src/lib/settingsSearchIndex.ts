@@ -33,10 +33,22 @@ export const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
     keywords: ['credit', 'source'],
   },
   {
+    id: 'general.criticRatings', section: 'general', anchor: 'critic-ratings',
+    label: 'Critic Ratings',
+    description: 'Add critic and audience scores to titles, for apps that show them.',
+    keywords: ['ratings', 'rotten tomatoes', 'metacritic', 'letterboxd', 'roger ebert', 'scores', 'critics'],
+  },
+  {
     id: 'general.displayAgeRating', section: 'general', anchor: 'display-age-rating',
     label: 'Display Age Rating',
     description: 'Show rating/certification in genres.',
     keywords: ['18+', 'certification', 'pg', 'mature'],
+  },
+  {
+    id: 'general.contentRatingCountry', section: 'general', anchor: 'content-rating-country',
+    label: 'Rating Country',
+    description: "Which country's rating the age rating shows, under Display Age Rating.",
+    keywords: ['certification', 'classification', 'age', 'country', 'region'],
   },
   {
     id: 'general.includeAdult', section: 'general', anchor: 'adult-content',
@@ -274,6 +286,12 @@ export const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
     keywords: ['tvdb', 'season', 'episode order'],
   },
   {
+    id: 'providers.tvdbNormalizeYearSeasons', section: 'providers', anchor: 'tvdb-normalize-year-seasons',
+    label: 'Normalize Year Seasons',
+    description: "Number year-based seasons 1, 2, 3… instead of TVDB's years (S2014).",
+    keywords: ['tvdb', 'season', 'year', 'normalize', 'numbering'],
+  },
+  {
     id: 'providers.scrapeImdb', section: 'providers', anchor: 'scrape-imdb',
     label: 'Scrape IMDb Data',
     description: "Automatically scrape additional data from IMDb to obtain IMDb ID when missing from TMDB. This is useful for sports events and other content that doesn't have an IMDb ID in TMDB.",
@@ -304,22 +322,34 @@ export const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
     keywords: ['anime', 'id', 'kitsu', 'mal', 'imdb', 'compatibility'],
   },
   {
+    id: 'providers.animeEpisodeDates', section: 'providers', anchor: 'anime-episode-dates',
+    label: 'Anime Episode Dates',
+    description: 'Show anime episodes as out when they first release anywhere, or when the English dub releases, instead of the metadata provider\'s date.',
+    keywords: ['anime', 'release', 'air date', 'dub', 'simulcast', 'streaming', 'schedule', 'anilist', 'animeschedule'],
+  },
+  {
     id: 'providers.skipFiller', section: 'providers', anchor: 'skip-filler',
     label: 'Skip Filler Episodes',
-    description: 'Automatically filter out episodes marked as filler.',
-    keywords: ['mal', 'filler', 'anime', 'episode'],
+    description: 'Leave out filler episodes of anime.',
+    keywords: ['mal', 'filler', 'anime', 'episode', 'tvdb', 'kitsu', 'animefillerlist'],
+  },
+  {
+    id: 'providers.skipMixedFiller', section: 'providers', anchor: 'skip-mixed-filler',
+    label: 'Also Skip Mixed Canon/Filler',
+    description: 'Leave out episodes that mix canon with filler as well.',
+    keywords: ['mixed', 'canon', 'filler', 'anime', 'episode'],
   },
   {
     id: 'providers.skipRecap', section: 'providers', anchor: 'skip-recap',
     label: 'Skip Recap Episodes',
-    description: 'Automatically filter out episodes marked as recaps.',
+    description: 'Leave out recap episodes.',
     keywords: ['mal', 'recap', 'anime', 'episode'],
   },
   {
     id: 'providers.allowEpisodeMarking', section: 'providers', anchor: 'allow-episode-marking',
-    label: 'Allow Episode Marking',
-    description: 'Enable users to mark episodes as filler or recap.',
-    keywords: ['mal', 'filler', 'recap', 'mark'],
+    label: 'Mark Filler and Recap Episodes',
+    description: 'Put [Filler], [Mixed] or [Recap] in front of the episode title.',
+    keywords: ['mal', 'filler', 'recap', 'mark', 'mixed', 'tag'],
   },
 
   // ── Art Providers — sections/ArtProviderSettings.tsx ──

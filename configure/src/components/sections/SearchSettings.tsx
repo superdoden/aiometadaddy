@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Edit2, GripVertical, Star, Sparkles } from 'lucide-react';
 import { allSearchProviders } from '@/data/catalogs';
-import { GEMINI_MODELS, DEFAULT_GEMINI_MODEL, DEFAULT_OPENROUTER_MODEL, resolveGeminiModel } from '@/data/ai-models';
+import { GEMINI_MODELS, DEFAULT_GEMINI_MODEL, DEFAULT_OPENROUTER_MODEL, isPresetModel, resolveGeminiModel } from '@/data/ai-models';
 import { useOpenRouterModels } from '@/hooks/useOpenRouterModels';
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, TouchSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
@@ -165,7 +165,7 @@ function SortableEngineRow(props: EngineRowProps) {
 }
 
 export function SearchSettings() {
-  const { config, setConfig, hasBuiltInTvdb, hasBuiltInGemini, traktSearchEnabled, simklSearchEnabled, lumiereEnabled } = useConfig();
+  const { config, setConfig, hasBuiltInTvdb, hasBuiltInGemini, traktSearchEnabled, simklSearchEnabled, lumiereEnabled, jikanEnabled } = useConfig();
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editType, setEditType] = useState('');
@@ -184,6 +184,7 @@ export function SearchSettings() {
   const hasRPDBKey = !!config.apiKeys?.rpdb || !!config.apiKeys?.topPoster || !!config.customPosterUrlPattern;
   const isTraktSearchEnabled = traktSearchEnabled;
   const isSimklSearchEnabled = simklSearchEnabled;
+  const animeSearchFallback = jikanEnabled ? 'mal' : 'kitsu';
 
   const caps = { hasTvdbKey, hasAnyAiKey };
   const slotViews = listSlots(config, caps);
@@ -224,6 +225,9 @@ export function SearchSettings() {
 
   const animeSearchProviders = allSearchProviders.filter(p => {
     if (p.value.startsWith('simkl.search') && !isSimklSearchEnabled) {
+      return false;
+    }
+    if (p.value.startsWith('mal.search') && !jikanEnabled) {
       return false;
     }
     return p.mediaType.includes('anime_movie') || p.mediaType.includes('anime_series');
@@ -436,8 +440,8 @@ export function SearchSettings() {
       const updates: Partial<Record<string, string>> = {};
       if (config.search.providers.movie === 'simkl.search') updates.movie = 'tmdb.search';
       if (config.search.providers.series === 'simkl.search') updates.series = 'tvdb.search';
-      if (config.search.providers.anime_movie === 'simkl.search.movie') updates.anime_movie = 'mal.search.movie';
-      if (config.search.providers.anime_series === 'simkl.search.series') updates.anime_series = 'mal.search.series';
+      if (config.search.providers.anime_movie === 'simkl.search.movie') updates.anime_movie = `${animeSearchFallback}.search.movie`;
+      if (config.search.providers.anime_series === 'simkl.search.series') updates.anime_series = `${animeSearchFallback}.search.series`;
 
       if (Object.keys(updates).length > 0) {
         setConfig(prev => ({
@@ -453,6 +457,19 @@ export function SearchSettings() {
       }
     }
   }, [simklSearchEnabled]);
+
+  useEffect(() => {
+    if (jikanEnabled) return;
+    const updates: Partial<Record<string, string>> = {};
+    if (config.search.providers.anime_movie === 'mal.search.movie') updates.anime_movie = 'kitsu.search.movie';
+    if (config.search.providers.anime_series === 'mal.search.series') updates.anime_series = 'kitsu.search.series';
+    if (Object.keys(updates).length > 0) {
+      setConfig(prev => ({
+        ...prev,
+        search: { ...prev.search, providers: { ...prev.search.providers, ...updates } },
+      }));
+    }
+  }, [jikanEnabled]);
 
   useEffect(() => {
     if (!traktSearchEnabled) {
@@ -618,7 +635,9 @@ export function SearchSettings() {
                     label="Model"
                     description={
                       (config.search.ai_provider || 'gemini') === 'openrouter'
-                        ? `Any OpenRouter model ID, ${config.search.ai_openrouter_web_search !== false ? 'with Web Search' : 'without Web Search'}`
+                        ? isPresetModel(config.search.ai_model)
+                          ? 'Any OpenRouter model ID or @preset/name'
+                          : `Any OpenRouter model ID or @preset/name, ${config.search.ai_openrouter_web_search !== false ? 'with Web Search' : 'without Web Search'}`
                         : (() => {
                             const selected = GEMINI_MODELS.find(m => m.id === resolveGeminiModel(config.search.ai_model));
                             return (selected?.grounding && config.search.ai_web_search) ? 'with Web Search' : 'without Web Search';
@@ -702,19 +721,23 @@ export function SearchSettings() {
                   {(() => {
                     const provider = config.search.ai_provider || 'gemini';
                     if (provider !== 'openrouter') return null;
-                    const enabled = config.search.ai_openrouter_web_search !== false;
+                    const preset = isPresetModel(config.search.ai_model);
+                    const enabled = config.search.ai_openrouter_web_search !== false && !preset;
 
                     return (
                       <>
                         <SettingRow
                           htmlFor="ai-openrouter-web-search"
                           label="Web Search"
-                          description="Adds :online so the model sees live results. Billed by OpenRouter at roughly $0.005 per search, on top of the model."
+                          description={preset
+                            ? 'A preset takes web search from its own settings on OpenRouter.'
+                            : 'Adds :online so the model sees live results. Billed by OpenRouter at roughly $0.005 per search, on top of the model.'}
                           control={
                             <Switch
                               id="ai-openrouter-web-search"
                               className="shrink-0"
                               checked={enabled}
+                              disabled={preset}
                               onCheckedChange={(checked) => setConfig(prev => ({
                                 ...prev,
                                 search: { ...prev.search, ai_openrouter_web_search: checked },

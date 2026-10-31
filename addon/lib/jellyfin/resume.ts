@@ -31,12 +31,24 @@ interface HeldRows {
   /** The tracker's activity when the rows were read; null where it reports none. */
   fingerprint: string | null;
   at: number;
+  ok: boolean;
 }
 
 const snapshots = new LRUCache<string, HeldRows>({
   max: envInt('JELLYFIN_RESUME_CACHE_MAX', 500, 1),
-  ttl: envInt('JELLYFIN_RESUME_MAX_AGE', 6 * 60 * 60, 60) * 1000,
+  ttl: 24 * 60 * 60 * 1000,
 });
+
+const resumeMaxAgeMs = (): number => envInt('JELLYFIN_RESUME_MAX_AGE', 15 * 60, 60) * 1000;
+
+const resumeFloorPercent = (): number => Math.min(envInt('JELLYFIN_MIN_RESUME_PERCENT', 0, 0), 49);
+
+export function belowResumeFloor(positionMs: number, runtimeMs: number): boolean {
+  const floor = resumeFloorPercent();
+  return floor > 0 && runtimeMs > 0 && positionMs > 0 && positionMs < (runtimeMs * floor) / 100;
+}
+
+const belowTrackerFloor = (progress: number): boolean => progress < Math.min(2, resumeFloorPercent());
 
 // A watch ends a paused session as surely as a pause starts one.
 const MDBLIST_PLAYBACK_FIELDS = ['paused_at', 'episode_paused_at', 'watched_at', 'episode_watched_at', 'season_watched_at'];
@@ -65,7 +77,7 @@ async function playbackFingerprint(service: Capable, credential: string, config:
   return null;
 }
 
-const inFlight = new Map<string, Promise<ResumeRow[]>>();
+const inFlight = new Map<string, Promise<HeldRows>>();
 
 const generations = new Map<string, number>();
 export const generationOf = (userUUID: string): number => generations.get(userUUID) ?? 0;
@@ -86,16 +98,19 @@ export interface ResolveTrace {
   tmdbDown?: Set<string>;
 }
 
+export type EpisodeNumbering = 'tmdb' | 'tvdb';
+
 export async function videoIdFor(
   ids: Record<string, any>,
   season: number,
   episode: number,
   config: any = {},
-  trace?: ResolveTrace
+  trace?: ResolveTrace,
+  numbering: EpisodeNumbering = 'tmdb'
 ): Promise<{ metaId: string; videoId: string; mediaType: 'anime' | 'series' } | null> {
   ids = await canonicalIds(ids, 'series', config);
-  // MDBList and PublicMetaDB number episodes the way TMDB does.
-  if (ids.tmdb) {
+  // MDBList and PublicMetaDB number episodes the way TMDB does, unless they name TVDB's.
+  if (ids.tmdb && numbering === 'tmdb') {
     const viaTmdb = await fromTmdbNumbering(ids, season, episode, config, trace);
     if (viaTmdb) return viaTmdb;
   }
@@ -135,6 +150,10 @@ export async function videoIdFor(
           mediaType: 'anime',
         };
       }
+      const listed = idMapper.resolveKitsuEpisodeFromTvdbMapping(tvdb, season, episode);
+      if (listed) {
+        return { metaId: `kitsu:${listed.kitsuId}`, videoId: `kitsu:${listed.kitsuId}:${listed.episodeNumber}`, mediaType: 'anime' };
+      }
     } catch (error: any) {
       logger.debug(`Anime resolution failed for tvdb ${tvdb} S${season}E${episode}: ${error?.message}`);
     }
@@ -167,11 +186,12 @@ async function mdblistRows(apiKey: string, config: any): Promise<ResumeRow[]> {
     }
 
     const show = entry?.show;
-    const season = Number(entry?.episode?.season);
-    const episode = Number(entry?.episode?.number);
-    if (!show || !Number.isFinite(season) || !Number.isFinite(episode)) continue;
+    const { mdblistWatchedRef } = require('../../utils/mdbList');
+    const ref = show ? await mdblistWatchedRef({ ...entry?.episode, show }, config) : null;
+    if (!ref) continue;
+    const { season, episode } = ref;
 
-    const resolved = await videoIdFor(await canonicalIds(show.ids ?? {}, 'series', config), season, episode, config);
+    const resolved = await videoIdFor(ref.tvdb ? ref.ids : await canonicalIds(ref.ids, 'series', config), season, episode, config, undefined, ref.tvdb ? 'tvdb' : 'tmdb');
     if (!resolved) {
       logger.debug(`No id for a resume row: ${show.title} S${season}E${episode}`);
       continue;
@@ -321,7 +341,7 @@ async function rowsFrom(service: Capable, credential: string, config: any): Prom
 }
 
 // No id mapping: the video id was recorded in the space the client played it in.
-async function ownRows(userUUID: string, profile: string): Promise<ResumeRow[]> {
+async function ownRows(userUUID: string, profile: string, config: any): Promise<ResumeRow[]> {
   const database: any = require('../database');
   const { parseStremioId } = require('./ids');
   const limit = envInt('JELLYFIN_RESUME_OWN_LIMIT', 100, 1);
@@ -339,7 +359,7 @@ async function ownRows(userUUID: string, profile: string): Promise<ResumeRow[]> 
     const videoId = String(r.video_id);
     const runtimeMs = Number(r.runtime_ms) || 0;
     const positionMs = Number(r.position_ms) || 0;
-    if (runtimeMs <= 0 || positionMs <= 0) continue;
+    if (runtimeMs <= 0 || positionMs <= 0 || belowResumeFloor(positionMs, runtimeMs)) continue;
 
     const parsed = parseStremioId(videoId);
     const isEpisode = Boolean(parsed && parsed.episode !== null && parsed.episode !== undefined);
@@ -360,9 +380,25 @@ async function ownRows(userUUID: string, profile: string): Promise<ResumeRow[]> 
   }
 
   // The earliest write of a batch is the spelling the client played under.
-  const { dedupeByAlias } = require('./aliases');
+  const { dedupeByAlias, videoIdAliases } = require('./aliases');
+  const { movieSpellings } = require('./watched');
   const deduped: ResumeRow[] = await dedupeByAlias([...rows].sort((a, b) => (a.writtenAt ?? 0) - (b.writtenAt ?? 0)));
-  return deduped.sort((a, b) => b.updatedAt - a.updatedAt);
+  const spellingsOf = new Map<string, string[]>();
+  for (const row of deduped) {
+    spellingsOf.set(row.videoId, row.kind === 'movie' ? await movieSpellings(row.videoId, config) : await videoIdAliases(row.videoId));
+  }
+  let held = new Map<string, any>();
+  try {
+    held = await database.getPlaystates(userUUID, [...new Set([...spellingsOf.values()].flat())], profile);
+  } catch (error: any) {
+    logger.debug(`Own resume spellings unavailable: ${error?.message || error}`);
+  }
+  const finishedSince = (row: ResumeRow): boolean =>
+    (spellingsOf.get(row.videoId) ?? []).some((spelling) => {
+      const other = held.get(spelling);
+      return Boolean(other) && Number(other.played) === 1 && !(Number(other.position_ms) > 0) && Number(other.updated_at) > (row.writtenAt ?? 0);
+    });
+  return deduped.filter((row) => !finishedSince(row)).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export async function resumeSnapshot(userUUID: string, config: any): Promise<ResumeRow[]> {
@@ -370,8 +406,8 @@ export async function resumeSnapshot(userUUID: string, config: any): Promise<Res
   const database: any = require('../database');
   const profile = profileKey(config);
 
-  const own = await ownRows(userUUID, profile);
   const tracker = readsTrackers(config) ? await trackerSnapshot(userUUID, config) : [];
+  const own = await ownRows(userUUID, profile, config);
   let known = new Map<string, any>();
   try {
     const { getPlaystatesAcross } = require('./aliases');
@@ -379,16 +415,20 @@ export async function resumeSnapshot(userUUID: string, config: any): Promise<Res
   } catch (error: any) {
     logger.debug(`Own playstate rows unavailable: ${error?.message || error}`);
   }
-  // A play is written under every id it is known by; one row per resolved title.
-  const { titleIdentity } = require('./canonicalIds');
   const overrides = tracker.filter((row) => known.has(row.videoId) && trackerPositionWins(row, known.get(row.videoId)));
-  const candidates = [...overrides, ...own, ...tracker.filter((r) => !known.has(r.videoId))];
+  return oneRowPerTitle([...overrides, ...own, ...tracker.filter((r) => !known.has(r.videoId))], config);
+}
+
+// A play is written under every id it is known by; one row per resolved title.
+export async function oneRowPerTitle(candidates: ResumeRow[], config: any): Promise<ResumeRow[]> {
+  const { titleIdentity } = require('./canonicalIds');
+  const { videoIdAliases } = require('./aliases');
   const taken = new Set<string>();
   const rows: ResumeRow[] = [];
   for (const row of candidates) {
-    const identity = await titleIdentity(row.videoId, config);
-    if (taken.has(identity)) continue;
-    taken.add(identity);
+    const spellings = [row.videoId, await titleIdentity(row.videoId, config), ...(await videoIdAliases(row.videoId))];
+    if (spellings.some((spelling) => taken.has(spelling))) continue;
+    for (const spelling of spellings) taken.add(spelling);
     rows.push(row);
   }
   return rows.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -431,29 +471,34 @@ export async function trackerPositions(userUUID: string, config: any): Promise<M
 // that app's tracker. The same video on two of them takes the newer position.
 export async function trackerSnapshot(userUUID: string, config: any): Promise<ResumeRow[]> {
   const parts = await Promise.all(
-    resumeSourcesFor(config).map(async (service) =>
-      (await serviceSnapshot(userUUID, config, service)).map((row) => ({ ...row, service }))
-    )
+    resumeSourcesFor(config).map(async (service) => {
+      const part = await serviceSnapshot(userUUID, config, service);
+      return { ok: part.ok, rows: part.rows.map((row) => ({ ...row, service })) };
+    })
   );
+  const { homedRows } = require('./episodeHome');
+  const homed: ResumeRow[] = await homedRows(userUUID, config, parts.flatMap((part) => part.rows));
   const merged = new Map<string, ResumeRow>();
-  for (const row of parts.flat()) {
+  for (const row of homed) {
     const held = merged.get(row.videoId);
     if (!held || row.updatedAt > held.updatedAt) merged.set(row.videoId, row);
   }
   const { dedupeByAlias } = require('./aliases');
-  return dedupeByAlias([...merged.values()].sort((a, b) => b.updatedAt - a.updatedAt));
+  const rows: ResumeRow[] = await dedupeByAlias([...merged.values()].sort((a, b) => b.updatedAt - a.updatedAt));
+  if (parts.length && parts.every((part) => part.ok)) await followTrackerClears(userUUID, config, rows);
+  return rows.filter((row) => !belowTrackerFloor(row.progress));
 }
 
-async function serviceSnapshot(userUUID: string, config: any, service: Capable): Promise<ResumeRow[]> {
+async function serviceSnapshot(userUUID: string, config: any, service: Capable): Promise<{ rows: ResumeRow[]; ok: boolean }> {
   const credential = credentialFor(config, service);
-  if (!credential) return [];
+  if (!credential) return { rows: [], ok: false };
 
   const key = `${userUUID}:${service}:${createHash('sha256').update(String(credential)).digest('hex').slice(0, 16)}`;
   const held = snapshots.get(key);
   // Read again only once the tracker reports playback moved; one that reports nothing is read on a timer.
-  if (held && Date.now() - held.at < envInt('JELLYFIN_RESUME_TTL', 60, 1) * 1000) return held.rows;
+  if (held && Date.now() - held.at < envInt('JELLYFIN_RESUME_TTL', 60, 1) * 1000) return held;
   const fingerprint = await playbackFingerprint(service, credential, config);
-  if (held && fingerprint && fingerprint === held.fingerprint) return held.rows;
+  if (held && fingerprint && fingerprint === held.fingerprint && (service !== 'mdblist' || Date.now() - held.at < resumeMaxAgeMs())) return held;
 
   const generation = generationOf(userUUID);
   const flightKey = `${generation}:${key}`;
@@ -463,13 +508,15 @@ async function serviceSnapshot(userUUID: string, config: any, service: Capable):
   const started = (async () => {
     try {
       const rows = await rowsFrom(service, credential, config);
-      if (generationOf(userUUID) === generation) snapshots.set(key, { rows, fingerprint, at: Date.now() });
+      const read = { rows, fingerprint, at: Date.now(), ok: true };
+      if (generationOf(userUUID) === generation) snapshots.set(key, read);
       logger.debug(`Resume snapshot for ${userUUID} from ${service}: ${rows.length} rows`);
-      return rows;
+      return read;
     } catch (error: any) {
-      if (generationOf(userUUID) === generation) snapshots.set(key, { rows: [], fingerprint: null, at: Date.now() });
+      const failed = { rows: [], fingerprint: null, at: Date.now(), ok: false };
+      if (generationOf(userUUID) === generation) snapshots.set(key, failed);
       logger.warn(`Resume snapshot from ${service} failed: ${error?.message || error}; not read again for ${envInt('JELLYFIN_RESUME_TTL', 60, 1)}s`);
-      return [];
+      return failed;
     } finally {
       if (inFlight.get(flightKey) === started) inFlight.delete(flightKey);
     }
@@ -483,15 +530,109 @@ async function serviceSnapshot(userUUID: string, config: any, service: Capable):
 // rewatch is, so Played comes from the watch history rather than being assumed
 // false because the row is resumable.
 /** Dropped when this server is itself the thing that changed the state. */
+const clearsFollowed = new LRUCache<string, string>({ max: envInt('JELLYFIN_RESUME_CACHE_MAX', 500, 1) });
+const clearsInFlight = new Map<string, Promise<void>>();
+
+async function followTrackerClears(userUUID: string, config: any, rows: ResumeRow[]): Promise<void> {
+  const { profileKey } = require('./profiles');
+  const profile = profileKey(config);
+  const sources = resumeSourcesFor(config).map((service) => `${service}:${credentialFor(config, service)}`).join('|');
+  const key = `${userUUID}:${profile}:${createHash('sha256').update(sources).digest('hex').slice(0, 16)}`;
+  const ids = [...new Set(rows.map((row) => row.videoId))].sort();
+  const digest = createHash('sha256').update(ids.join(',')).digest('hex').slice(0, 16);
+  if (clearsFollowed.get(key) === digest) return;
+
+  const running = clearsInFlight.get(key);
+  if (running) return running;
+  const started = (async () => {
+    try {
+      await reconcileClears(userUUID, profile, config, key, ids, digest);
+      clearsFollowed.set(key, digest);
+    } catch (error: any) {
+      logger.debug(`Tracker resume clears not followed for ${userUUID}: ${error?.message || error}`);
+    } finally {
+      clearsInFlight.delete(key);
+    }
+  })();
+  clearsInFlight.set(key, started);
+  return started;
+}
+
+async function reconcileClears(userUUID: string, profile: string, config: any, key: string, ids: string[], digest: string): Promise<void> {
+  const { readGlobalCache, writeGlobalCache } = require('../getCache');
+  const storeKey = `jellyfin_tracker_paused_v1:${key}`;
+  const held = await readGlobalCache(storeKey);
+  if (held?.digest === digest) return;
+
+  if (Array.isArray(held?.ids)) {
+    const cleared = await clearDropped(userUUID, profile, config, held.ids, Number(held.seenAt) || 0, new Set(ids));
+    if (cleared) {
+      forgetShelves(userUUID);
+      logger.info(`${cleared} resume point(s) the tracker no longer holds removed from the playstate of ${userUUID}`);
+    }
+  }
+  await writeGlobalCache(storeKey, { digest, seenAt: Date.now(), ids }, envInt('JELLYFIN_TRACKER_SEEN_DAYS', 30, 1) * 24 * 60 * 60);
+}
+
+async function clearDropped(userUUID: string, profile: string, config: any, before: string[], seenAt: number, current: Set<string>): Promise<number> {
+  const gone = before.filter((id) => !current.has(id));
+  if (!gone.length) return 0;
+  if (gone.length > Math.max(10, before.length / 2)) {
+    logger.warn(`Tracker resume list for ${userUUID} lost ${gone.length} of ${before.length} titles at once; not treated as cleared`);
+    return 0;
+  }
+
+  const database: any = require('../database');
+  const { parseStremioId } = require('./ids');
+  const { videoIdAliases } = require('./aliases');
+  const { movieSpellings } = require('./watched');
+  let cleared = 0;
+  for (const id of gone) {
+    const parsed = parseStremioId(id);
+    const isEpisode = Boolean(parsed && parsed.episode !== null && parsed.episode !== undefined);
+    const spellings = [id, ...(isEpisode ? await videoIdAliases(id) : await movieSpellings(id, config))];
+    if (spellings.some((spelling) => current.has(spelling))) continue;
+
+    const rows = [...(await database.getPlaystates(userUUID, spellings, profile)).values()].filter((row: any) => Number(row.position_ms) > 0);
+    if (!rows.length || rows.some((row: any) => Number(row.last_played_at) > seenAt)) continue;
+
+    const at = Date.now();
+    rows.sort((a: any, b: any) => (Number(a.updated_at) || 0) - (Number(b.updated_at) || 0));
+    for (const [index, row] of rows.entries()) await database.upsertPlaystate(userUUID, row.video_id, { positionMs: 0 }, profile, at + index);
+    cleared += 1;
+  }
+  return cleared;
+}
+
+function forgetShelves(userUUID: string): void {
+  for (const cache of [positionMemo, nextUpPages, lastNextUp] as LRUCache<string, any>[]) {
+    for (const key of [...cache.keys()]) {
+      if (String(key).startsWith(`${userUUID}:`)) cache.delete(key);
+    }
+  }
+}
+
 export function invalidateResume(userUUID: string): void {
-  generations.set(userUUID, generationOf(userUUID) + 1);
+  forgetOwnWatches(userUUID);
   for (const key of [...snapshots.keys()]) {
     if (String(key).startsWith(`${userUUID}:`)) snapshots.delete(key);
   }
+}
+
+/** A watch this server recorded: what is built from its table is rebuilt, the tracker reads are kept. */
+export function forgetOwnWatches(userUUID: string): void {
+  generations.set(userUUID, generationOf(userUUID) + 1);
   for (const cache of [nextUpPages, lastNextUp]) {
     for (const key of [...cache.keys()]) {
       if (String(key).startsWith(`${userUUID}:`)) cache.delete(key);
     }
+  }
+}
+
+/** Drops a user's held Upcoming and calendar lists. */
+export function invalidateDatedShelves(userUUID: string): void {
+  for (const key of [...nextUpPages.keys()]) {
+    if (String(key).startsWith(`${userUUID}:`) && /:(upcoming|calendar):/.test(String(key))) nextUpPages.delete(key);
   }
 }
 

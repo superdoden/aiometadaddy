@@ -63,7 +63,7 @@ function _parseStremioId(stremioId: string): AllIds {
   return ids;
 }
 
-function _handleAnimeMapping(allIds: AllIds): void {
+function _handleAnimeMapping(allIds: AllIds, type: string): void {
   const providers = ['mal', 'kitsu', 'anidb', 'anilist'];
   const mappingFunctions: Record<string, (id: string) => any> = {
     mal: idMapper.getMappingByMalId,
@@ -75,11 +75,12 @@ function _handleAnimeMapping(allIds: AllIds): void {
   for (const provider of providers) {
     const id = allIds[`${provider}Id`];
     if (id) {
-      const mapping = mappingFunctions[provider](id);
+      const mapping = mappingFunctions[provider](id) ?? (provider === 'mal' && type === 'movie' ? { type: 'MOVIE', mal_id: Number(id) } : null);
       if (mapping) {
-        allIds.tmdbId = allIds.tmdbId || mapping.themoviedb_id;
-        allIds.imdbId = allIds.imdbId || mapping.imdb_id;
-        allIds.tvdbId = allIds.tvdbId || mapping.tvdb_id;
+        const film = type === 'movie' || mapping.type === 'MOVIE' ? idMapper.filmIdsFor(mapping) : null;
+        allIds.tmdbId = allIds.tmdbId || (film ? film.tmdbId : mapping.themoviedb_id);
+        allIds.imdbId = allIds.imdbId || (film ? film.imdbId : mapping.imdb_id);
+        allIds.tvdbId = allIds.tvdbId || (film ? null : mapping.tvdb_id);
         allIds.tvmazeId = allIds.tvmazeId || mapping.tvmaze_id;
         allIds.malId = allIds.malId || mapping.mal_id;
         allIds.kitsuId = allIds.kitsuId || mapping.kitsu_id;
@@ -249,24 +250,43 @@ async function _fetchFromTvmaze(tvmazeId: string, config: any): Promise<Record<s
   }
 }
 
+const CINEMETA_HOSTS = ['cinemeta-live.strem.io', 'v3-cinemeta.strem.io'];
+
 async function getExternalIdsFromImdb(imdbId: string, type: string): Promise<{ tmdbId: string | null; tvdbId: string | null } | undefined> {
   if (!imdbId || imdbId.toString().trim() === '') return undefined;
-  const url = `https://cinemeta-live.strem.io/meta/${type}/${imdbId}.json`;
-
-  try {
-    const { data } = await httpGet(url);
-    const tvdbId = data?.meta?.tvdb_id;
-    const tmdbId = data?.meta?.moviedb_id || data?.meta?.themoviedb_id || data?.meta?.tmdb_id;
-    return {
-      tmdbId: (tmdbId && tmdbId.toString().trim() !== '') ? tmdbId : null,
-      tvdbId: (tvdbId && tvdbId.toString().trim() !== '') ? tvdbId : null,
-    };
-  } catch (error: any) {
-    logger.warn(`[Cinemeta] Could not fetch external ids for ${imdbId}: ${error.message}`);
-    return undefined;
+  let found: { tmdbId: string | null; tvdbId: string | null } | undefined;
+  for (const host of CINEMETA_HOSTS) {
+    try {
+      const { data } = await httpGet(`https://${host}/meta/${type}/${imdbId}.json`);
+      const tvdbId = data?.meta?.tvdb_id;
+      const tmdbId = data?.meta?.moviedb_id || data?.meta?.themoviedb_id || data?.meta?.tmdb_id;
+      found = {
+        tmdbId: (tmdbId && tmdbId.toString().trim() !== '') ? tmdbId : null,
+        tvdbId: (tvdbId && tvdbId.toString().trim() !== '') ? tvdbId : null,
+      };
+      if (found.tmdbId || found.tvdbId) return found;
+    } catch (error: any) {
+      logger.warn(`[Cinemeta] Could not fetch external ids for ${imdbId} from ${host}: ${error.message}`);
+    }
   }
+  return found;
 }
 
+
+async function cachedTmdbGone(type: string, mapping: any, config: any): Promise<boolean> {
+  if (!mapping?.tmdb_id || (type !== 'movie' && type !== 'series')) return false;
+  const { envInt } = require('../utils/envNumber');
+  const age = Date.now() - Date.parse(mapping.updated_at ?? '');
+  if (Number.isFinite(age) && age < envInt('ID_CACHE_RECHECK_DAYS', 7, 1) * 24 * 60 * 60 * 1000) return false;
+  try {
+    const found = type === 'movie' ? await moviedb.movieInfo({ id: mapping.tmdb_id }, config) : await moviedb.tvInfo({ id: mapping.tmdb_id }, config);
+    if (!found) return true;
+    await redisIdCache.saveIdMapping(type, mapping.tmdb_id, mapping.tvdb_id, mapping.imdb_id, mapping.tvmaze_id);
+  } catch (error: any) {
+    logger.debug(`Could not recheck TMDB ${mapping.tmdb_id}: ${error?.message || error}`);
+  }
+  return false;
+}
 
 async function resolveAllIds(stremioId: string, type: string, config: any, prefetchedIds: Record<string, any> = {}, targetProviders: string[] = []): Promise<AllIds | null> {
   const startTime = Date.now();
@@ -282,7 +302,7 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
 
   if (isAnime) {
     performanceStats.animeResolutions++;
-    _handleAnimeMapping(allIds);
+    _handleAnimeMapping(allIds, type);
     const duration = Date.now() - startTime;
     timingMetrics.recordTiming('id_resolution_anime', duration, {
       type,
@@ -345,7 +365,11 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
     }
 
 
-    const cachedMapping = await redisIdCache.getCachedIdMapping(type, allIds.tmdbId, allIds.tvdbId, allIds.imdbId, allIds.tvmazeId);
+    let cachedMapping = await redisIdCache.getCachedIdMapping(type, allIds.tmdbId, allIds.tvdbId, allIds.imdbId, allIds.tvmazeId);
+    if (cachedMapping && !allIds.tmdbId && await cachedTmdbGone(type, cachedMapping, config)) {
+      await redisIdCache.forgetIdMapping(type, cachedMapping);
+      cachedMapping = null;
+    }
     if (cachedMapping) {
       logger.debug(` Found cached mapping for ${stremioId}`);
       allIds.tmdbId = allIds.tmdbId || cachedMapping.tmdb_id;

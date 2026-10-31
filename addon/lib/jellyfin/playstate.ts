@@ -2,7 +2,7 @@ import consola from 'consola';
 import { LRUCache } from 'lru-cache';
 import { envInt } from '../../utils/envNumber';
 import redis from '../redisClient';
-import { decodeJellyfinId, encodeJellyfinId, normaliseJellyfinId, parseStremioId, stremioIdFor } from './ids';
+import { dashedGuid, decodeJellyfinId, encodeJellyfinId, normaliseJellyfinId, parseStremioId, stremioIdFor } from './ids';
 import { mapWithConcurrency } from '../../utils/concurrency';
 import { fetchMeta } from './items';
 import { upsertPlaystateEverywhere } from './aliases';
@@ -11,8 +11,64 @@ const logger = consola.withTag('JellyfinPlaystate');
 
 const TICKS_PER_MS = 10000;
 
-function watchedAtPercent(): number {
+const playedThresholds = new LRUCache<string, { percent: number | null }>({
+  max: 5000,
+  ttl: envInt('JELLYFIN_USER_SETTINGS_CACHE_MS', 60000, 0) || 1,
+});
+
+/** A profile's settings were saved, so they are read again. */
+export function forgetUserSettings(userUUID: string): void {
+  for (const key of playedThresholds.keys()) if (key.startsWith(`${userUUID}:`)) playedThresholds.delete(key);
+}
+
+const USER_CONFIGURATION_ID = 'user-configuration';
+
+export function serverPlayedThreshold(): number {
   return envInt('JELLYFIN_PLAYED_THRESHOLD', 80, 1);
+}
+
+export function validPlayedThreshold(value: unknown): number | null {
+  const percent = typeof value === 'number' || typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(percent) && percent >= 50 && percent <= 100 ? percent : null;
+}
+
+export async function storedPlayedThreshold(userUUID: string, profileId: string | null): Promise<number | null> {
+  const key = `${userUUID}:${profileId ?? ''}`;
+  let held = playedThresholds.get(key);
+  if (!held) {
+    try {
+      const database = require('../database');
+      const { profileById } = require('./profiles');
+      const config = await database.getUserConfig(userUUID);
+      const profile = profileById(config, userUUID, profileId);
+      const stored = await database.getPreferences(userUUID, profile?.id ?? '', USER_CONFIGURATION_ID, '');
+      held = { percent: validPlayedThreshold(stored?.PlayedThresholdPercent) };
+    } catch {
+      held = { percent: null };
+    }
+    playedThresholds.set(key, held);
+  }
+  return held.percent;
+}
+
+export async function playedThresholdFor(userUUID: string, profileId: string | null): Promise<number> {
+  return (await storedPlayedThreshold(userUUID, profileId)) ?? serverPlayedThreshold();
+}
+
+export async function savePlayedThreshold(userUUID: string, profileId: string | null, percent: number | null): Promise<void> {
+  const database = require('../database');
+  const stored = (await database.getPreferences(userUUID, profileId ?? '', USER_CONFIGURATION_ID, '')) || {};
+  const next = { ...stored };
+  if (percent === null) delete next.PlayedThresholdPercent;
+  else next.PlayedThresholdPercent = percent;
+  await database.savePreferences(userUUID, profileId ?? '', USER_CONFIGURATION_ID, '', next);
+  forgetUserSettings(userUUID);
+}
+
+/** The share of a title played that counts as watched: the user's own setting, else the server's. */
+async function watchedAtPercent(req: any): Promise<number> {
+  const userUUID = req?.params?.userUUID;
+  return userUUID ? playedThresholdFor(userUUID, req.jellyfin?.profileId ?? null) : serverPlayedThreshold();
 }
 
 interface SessionPosition {
@@ -25,7 +81,13 @@ interface SessionPosition {
   /** The profile signed in, which may be playing into the account's shared history. */
   viewer?: string | null;
   device?: string;
+  /** The app and device names the client gave, for showing the session. */
+  app?: { client: string; device: string; version: string };
   playSession?: string;
+  /** When progress passed the watched mark, so the stop that follows does not report it again. */
+  playedAt?: number;
+  /** Below the mark again since, with a resume point written. */
+  rewound?: boolean;
 }
 
 // A client that dies never sends a stop, so the last tick is kept and a stop
@@ -46,14 +108,25 @@ const POSITIONS_KEY = 'jf:pos';
 // polls every ten seconds and only wants what is current. An index scored by
 // last tick keeps that read proportional to live sessions, not to the day.
 const POSITIONS_INDEX = 'jf:pos:live';
+// The same, per configuration, so one account's read never walks every other's.
+const accountIndex = (userUUID: string) => `${POSITIONS_INDEX}:${userUUID}`;
+
+function liveWindowSeconds(): number {
+  return envInt('JELLYFIN_LIVE_SESSION_WINDOW', 60 * 60, 60);
+}
 
 function liveWindowMs(): number {
-  return envInt('JELLYFIN_LIVE_SESSION_WINDOW', 60 * 60, 60) * 1000;
+  return liveWindowSeconds() * 1000;
 }
 
 function playSessionOf(body: any): string | undefined {
   const id = body?.PlaySessionId ?? body?.playSessionId;
   return typeof id === 'string' && id ? id : undefined;
+}
+
+function appOf(req: any): SessionPosition['app'] {
+  const { client, device, version } = require('./context').clientInfo(req);
+  return { client, device, version };
 }
 
 function sameSession(known: SessionPosition, device: string, playSession: string | undefined): boolean {
@@ -80,6 +153,7 @@ function setPosition(key: string, value: SessionPosition): void {
   positions.set(key, value);
   if (!redis) return;
   const ttl = sessionTtlSeconds();
+  const own = accountIndex(key.split(':')[0]);
   redis.multi()
     .hsetex(POSITIONS_KEY, 'EX', ttl, 'FIELDS', 1, key, JSON.stringify(value))
     .expire(POSITIONS_KEY, ttl, 'NX')
@@ -87,16 +161,18 @@ function setPosition(key: string, value: SessionPosition): void {
     .zadd(POSITIONS_INDEX, value.at, key)
     .expire(POSITIONS_INDEX, ttl, 'NX')
     .expire(POSITIONS_INDEX, ttl, 'GT')
+    .zadd(own, value.at, key)
+    .expire(own, liveWindowSeconds())
     .exec()
     .catch(() => undefined);
 }
 
 function deletePosition(key: string): void {
   positions.delete(key);
-  if (redis) redis.multi().hdel(POSITIONS_KEY, key).zrem(POSITIONS_INDEX, key).exec().catch(() => undefined);
+  if (redis) redis.multi().hdel(POSITIONS_KEY, key).zrem(POSITIONS_INDEX, key).zrem(accountIndex(key.split(':')[0]), key).exec().catch(() => undefined);
 }
 
-export type LiveSession = { userUUID: string; profile: string; viewer: string | null; itemId: string; positionMs: number; at: number; paused: boolean };
+export type LiveSession = { userUUID: string; profile: string; viewer: string | null; itemId: string; positionMs: number; at: number; paused: boolean; device: string | null; app: SessionPosition['app'] | null; playSession: string | null };
 
 /**
  * Every session the instance has heard from, newest first. Read from Redis so
@@ -104,15 +180,24 @@ export type LiveSession = { userUUID: string; profile: string; viewer: string | 
  * entries win, being the fresher of the two.
  */
 export async function liveSessions(): Promise<LiveSession[]> {
+  return readLive(POSITIONS_INDEX, '');
+}
+
+/** One configuration's sessions, read from its own index. */
+export async function liveSessionsFor(userUUID: string): Promise<LiveSession[]> {
+  return readLive(accountIndex(userUUID), `${userUUID}:`);
+}
+
+async function readLive(index: string, prefix: string): Promise<LiveSession[]> {
   const cutoff = Date.now() - liveWindowMs();
   const rows = new Map<string, SessionPosition>();
-  for (const [key, value] of positions.entries()) if (value.at >= cutoff) rows.set(key, value);
+  for (const [key, value] of positions.entries()) if (value.at >= cutoff && key.startsWith(prefix)) rows.set(key, value);
 
   if (redis) {
     try {
       const cap = envInt('JELLYFIN_SESSION_CACHE_MAX', 5000, 1);
-      const keys: string[] = await redis.zrevrangebyscore(POSITIONS_INDEX, '+inf', cutoff, 'LIMIT', 0, cap);
-      redis.zremrangebyscore(POSITIONS_INDEX, '-inf', `(${cutoff}`).catch(() => undefined);
+      const keys: string[] = await redis.zrevrangebyscore(index, '+inf', cutoff, 'LIMIT', 0, cap);
+      redis.zremrangebyscore(index, '-inf', `(${cutoff}`).catch(() => undefined);
       const wanted = keys.filter((key) => !rows.has(key));
       if (wanted.length > 0) {
         const stored: Array<string | null> = await redis.hmget(POSITIONS_KEY, ...wanted);
@@ -129,7 +214,7 @@ export async function liveSessions(): Promise<LiveSession[]> {
   for (const [key, value] of rows) {
     const [userUUID, profile, itemId] = key.split(':');
     if (!userUUID || !itemId) continue;
-    out.push({ userUUID, profile: profile || '', viewer: value.viewer ?? null, itemId, positionMs: value.positionMs, at: value.at, paused: value.paused === true });
+    out.push({ userUUID, profile: profile || '', viewer: value.viewer ?? null, itemId, positionMs: value.positionMs, at: value.at, paused: value.paused === true, device: value.device ?? null, app: value.app ?? null, playSession: value.playSession ?? null });
   }
   return out.sort((a, b) => b.at - a.at);
 }
@@ -183,6 +268,7 @@ function bodyItemId(req: any, body: any): string | null {
 }
 
 export interface ResolvedSession {
+  itemId: string;
   stremioType: 'movie' | 'series';
   videoId: string;
   descriptor: any;
@@ -236,7 +322,7 @@ async function resolveSession(userUUID: string, itemId: string, known?: any): Pr
     }
   }
 
-  const session: ResolvedSession = { stremioType, videoId, descriptor, runtimeMs, aliases: aliases.filter((id) => id !== videoId) };
+  const session: ResolvedSession = { itemId, stremioType, videoId, descriptor, runtimeMs, aliases: aliases.filter((id) => id !== videoId) };
   if (meta) resolvedSessions.set(cacheKey, session, { ttl: envInt('JELLYFIN_SESSION_CACHE_TTL', 12 * 60 * 60, 60) * 1000 });
   return session;
 }
@@ -293,13 +379,67 @@ function reportFor(
   };
 }
 
+async function listedFilms(userUUID: string, config: any): Promise<Set<string>> {
+  const { watchlistEntries } = require('./watchlist');
+  const { entries } = await watchlistEntries(userUUID, config);
+  return new Set(entries.map((entry: any) => String(entry.metaId)));
+}
+
+async function announce(userUUID: string, config: any, profile: string, session: ResolvedSession): Promise<void> {
+  const { hasListeners, pushUserData } = require('./socket');
+  if (!(await hasListeners(userUUID, profile))) return;
+  const database: any = require('../database');
+  const row = await database.getPlaystate(userUUID, session.videoId, profile);
+  const positionMs = Number(row?.position_ms) || 0;
+  const runtimeMs = Number(row?.runtime_ms) || session.runtimeMs || 0;
+  const played = Boolean(Number(row?.played));
+  let favourite = false;
+  if (session.descriptor.k === 'movie' && config) {
+    const listed = await listedFilms(userUUID, config).catch(() => new Set<string>());
+    favourite = [session.descriptor.i, ...session.aliases].some((id) => listed.has(String(id)));
+  }
+  const itemId = dashedGuid(normaliseJellyfinId(session.itemId));
+  pushUserData(userUUID, profile, [{
+    Key: itemId,
+    ItemId: itemId,
+    Played: played,
+    PlayCount: Math.max(played ? 1 : 0, Number(row?.play_count) || 0),
+    PlaybackPositionTicks: positionMs * TICKS_PER_MS,
+    PlayedPercentage: positionMs > 0 && runtimeMs > 0 ? Math.min(100, (positionMs / runtimeMs) * 100) : played ? 100 : 0,
+    LastPlayedDate: row?.last_played_at ? new Date(Number(row.last_played_at)).toISOString() : null,
+    IsFavorite: favourite,
+  }]);
+}
+
 async function recordPlaystate(
   userUUID: string,
   profile: string,
   session: ResolvedSession,
   event: 'start' | 'pause' | 'stop' | 'played' | 'unplayed',
   positionMs: number,
-  played: boolean | null
+  played: boolean | null,
+  config: any,
+  finished = false,
+  resetAll = false
+): Promise<void> {
+  await writePlaystate(userUUID, profile, session, event, positionMs, played, finished);
+  // Dropped before a client is told, so the read-back it makes sees the change.
+  const { forgetOwnWatches, invalidateResume } = require('./resume');
+  if (resetAll) invalidateResume(userUUID);
+  else if (played === true || event === 'unplayed') forgetOwnWatches(userUUID);
+  announce(userUUID, config, profile, session).catch((error: any) =>
+    logger.debug(`User data push failed for ${session.videoId}: ${error?.message || error}`)
+  );
+}
+
+async function writePlaystate(
+  userUUID: string,
+  profile: string,
+  session: ResolvedSession,
+  event: 'start' | 'pause' | 'stop' | 'played' | 'unplayed',
+  positionMs: number,
+  played: boolean | null,
+  finished = false
 ): Promise<void> {
   const database: any = require('../database');
   const videoId = session.videoId;
@@ -310,15 +450,20 @@ async function recordPlaystate(
       await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: 0, played: false, lastPlayedAt: null, origin: 'server' }, profile, session.aliases);
       return;
     }
+    const now = Date.now();
     if (event === 'played') {
-      await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: 0, runtimeMs, played: true, lastPlayedAt: Date.now(), origin: 'server' }, profile, session.aliases);
+      await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: 0, runtimeMs, played: true, lastPlayedAt: now, origin: 'server', watch: { at: now, kind: 'first' } }, profile, session.aliases);
       return;
     }
     if (event === 'stop' && played === true) {
-      await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: 0, runtimeMs, played: true, lastPlayedAt: Date.now(), origin: 'server' }, profile, session.aliases);
+      const gapMs = runtimeMs > 0 ? runtimeMs / 2 : envInt('JELLYFIN_REWATCH_MIN_GAP_MINUTES', 10, 0) * 60_000;
+      const watch = finished ? { at: now, kind: 'finish', gapMs } : undefined;
+      await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: 0, runtimeMs, played: true, lastPlayedAt: now, origin: 'server', ...(watch ? { watch } : {}) }, profile, session.aliases);
       return;
     }
-    await upsertPlaystateEverywhere(userUUID, videoId, { positionMs, runtimeMs, lastPlayedAt: Date.now(), origin: 'server' }, profile, session.aliases);
+    const { belowResumeFloor } = require('./resume');
+    const kept = belowResumeFloor(positionMs, runtimeMs) ? 0 : positionMs;
+    await upsertPlaystateEverywhere(userUUID, videoId, { positionMs: kept, runtimeMs, lastPlayedAt: Date.now(), origin: 'server' }, profile, session.aliases);
   } catch (error: any) {
     logger.warn(`Playstate write failed for ${videoId}: ${error?.message || error}`);
   }
@@ -355,6 +500,7 @@ async function report(
   const key = `${userUUID}:${profile}:${itemId}`;
   const known = await getPosition(key);
   const device = require('./context').clientInfo(req).deviceId as string;
+  const app = appOf(req);
   const playSession = playSessionOf(body);
   const reported = ticksToMs(body?.PositionTicks ?? body?.positionTicks);
   // A resume reported at zero is the client's habit, not a seek to the start.
@@ -365,36 +511,51 @@ async function report(
   // A client re-sends Playing while it runs; reopening an already-playing
   // session is noise. A resume comes through the pause edge instead.
   if (event === 'start' && known && known.paused === false && sameSession(known, device, playSession)) {
-    setPosition(key, { positionMs, at: Date.now(), paused: false, viewer: req.jellyfin?.profileId ?? null, device, playSession });
+    setPosition(key, { positionMs, at: Date.now(), paused: false, viewer: req.jellyfin?.profileId ?? null, device, app, playSession, playedAt: known.playedAt, rewound: known.rewound });
     return;
   }
+  const same = known && sameSession(known, device, playSession);
+  const playedAt = same ? known.playedAt : undefined;
 
   let played: boolean | null = null;
   if (event === 'played') played = true;
   if (event === 'stop') {
     played =
       session.runtimeMs && session.runtimeMs > 0
-        ? (positionMs / session.runtimeMs) * 100 >= watchedAtPercent()
+        ? (positionMs / session.runtimeMs) * 100 >= (await watchedAtPercent(req))
         : false;
     deletePosition(key);
   } else {
     // Recorded as playing, not unknown: a following tick reporting the same
     // state would otherwise read as a change and reopen the session.
-    setPosition(key, { positionMs, at: Date.now(), paused: event === 'pause', viewer: req.jellyfin?.profileId ?? null, device, playSession });
+    setPosition(key, { positionMs, at: Date.now(), paused: event === 'pause', viewer: req.jellyfin?.profileId ?? null, device, app, playSession, playedAt, rewound: same ? known.rewound : undefined });
   }
 
+  if (playedAt && (event === 'start' || event === 'pause' || played === true)) {
+    if (event === 'stop') await recordPlaystate(userUUID, profile, session, event, positionMs, played, config);
+    return;
+  }
+  await settle(userUUID, config, profile, session, event, positionMs, played, resumedFrom);
+}
+
+async function settle(
+  userUUID: string,
+  config: any,
+  profile: string,
+  session: ResolvedSession,
+  event: 'start' | 'pause' | 'stop' | 'played' | 'unplayed',
+  positionMs: number,
+  played: boolean | null,
+  resumedFrom: number | null = null
+): Promise<void> {
   // The table is written before any tracker is told, so a read never waits on one.
-  await recordPlaystate(userUUID, profile, session, event, positionMs, played);
+  await recordPlaystate(userUUID, profile, session, event, positionMs, played, config, event === 'stop' && played === true, !tellsTrackers(config));
   if (played === true && session.descriptor.k === 'episode') {
     const { undropOnWatch } = require('./dropped');
     undropOnWatch(userUUID, config, [session.descriptor.i]);
   }
 
-  if (!tellsTrackers(config)) {
-    const { invalidateResume } = require('./resume');
-    invalidateResume(userUUID);
-    return;
-  }
+  if (!tellsTrackers(config)) return;
 
   // A pause at zero is what a collapsed position looks like, and a real one says
   // nothing a tracker can use, so it is remembered without writing a resume
@@ -487,24 +648,28 @@ async function markEach(req: any, body: any, event: 'played' | 'unplayed', upTo 
       return null;
     }
     deletePosition(`${userUUID}:${profile}:${id}`);
-    await recordPlaystate(userUUID, profile, session, event, 0, played);
+    await writePlaystate(userUUID, profile, session, event, 0, played);
     return session;
   })).filter((s): s is ResolvedSession => s !== null);
+
+  // Every row is written before anything is dropped or a client told, so none reads half a season.
+  const { forgetOwnWatches, invalidateResume } = require('./resume');
+  if (tellsTrackers(config)) forgetOwnWatches(userUUID);
+  else invalidateResume(userUUID);
+  for (const session of sessions) {
+    announce(userUUID, config, profile, session).catch((error: any) =>
+      logger.debug(`User data push failed for ${session.videoId}: ${error?.message || error}`)
+    );
+  }
 
   if (played) {
     const { undropOnWatch } = require('./dropped');
     undropOnWatch(userUUID, config, sessions.filter((session) => session.descriptor.k === 'episode').map((session) => session.descriptor.i));
   }
-  if (!tellsTrackers(config)) {
-    const { invalidateResume } = require('./resume');
-    invalidateResume(userUUID);
-    return;
-  }
+  if (!tellsTrackers(config)) return;
   // A season or series goes to the trackers as one batch, not an event per episode.
   if (marked.scope) {
     const { handlePlaybackReport } = require('../playbackHandler');
-    const { invalidateResume } = require('./resume');
-    invalidateResume(userUUID);
     handlePlaybackReport('series', marked.metaId, {
       scope: marked.scope,
       event,
@@ -626,16 +791,49 @@ export async function recordProgress(req: any, body: any): Promise<void> {
   const newSession = !paused && !!previous?.playSession && !!session && previous.playSession !== session;
   if (!changed && !startsPaused && !newSession) {
     const now = Date.now();
-    const next: SessionPosition = { positionMs, at: now, paused, writtenAt: previous?.writtenAt, writtenMs: previous?.writtenMs, viewer: req.jellyfin?.profileId ?? previous?.viewer ?? null, device: previous?.device ?? require('./context').clientInfo(req).deviceId, playSession: previous?.playSession ?? playSessionOf(body) };
+    const next: SessionPosition = { positionMs, at: now, paused, writtenAt: previous?.writtenAt, writtenMs: previous?.writtenMs, viewer: req.jellyfin?.profileId ?? previous?.viewer ?? null, device: previous?.device ?? require('./context').clientInfo(req).deviceId, app: previous?.app ?? appOf(req), playSession: previous?.playSession ?? playSessionOf(body), playedAt: previous?.playedAt, rewound: previous?.rewound };
     // Table only; a tracker still hears edges alone.
     const interval = envInt('JELLYFIN_PROGRESS_WRITE_INTERVAL', 60, 0) * 1000;
     const moved = positionMs !== (previous?.writtenMs ?? -1);
-    if (interval > 0 && !paused && moved && now - (previous?.writtenAt ?? 0) >= interval) {
+    if (paused && previous && Math.abs(positionMs - previous.positionMs) >= 1000) {
       const config = await loadConfig(req);
       const session = config ? await resolvePlaying(userUUID, itemId, body) : null;
       if (session) {
-        logger.debug(`Progress ${session.videoId} at ${positionMs}ms`);
-        await recordPlaystate(userUUID, profileKey(config), session, 'start', positionMs, null);
+        await recordPlaystate(userUUID, profileKey(config), session, 'pause', positionMs, null, config);
+        next.writtenAt = now;
+        next.writtenMs = positionMs;
+      }
+    } else if (interval > 0 && !paused && moved && now - (previous?.writtenAt ?? 0) >= interval) {
+      const config = await loadConfig(req);
+      const session = config ? await resolvePlaying(userUUID, itemId, body) : null;
+      if (session) {
+        // Past the mark the title counts as watched now, as a Jellyfin server does it,
+        // so a client that moves on without a usable stop still leaves it watched.
+        // Rewound below it, the position is kept again; the watch stands.
+        const finished = Boolean(session.runtimeMs && (positionMs / session.runtimeMs) * 100 >= (await watchedAtPercent(req)));
+        logger.debug(`Progress ${session.videoId} at ${positionMs}ms${finished ? ', past the watched mark' : ''}`);
+        // Only a position played up to counts, not one jumped to: since the last report it
+        // moved no further than playback could have, so scrubbing ahead and back marks nothing.
+        const played = previous ? positionMs - previous.positionMs : -1;
+        const continuous = played >= 0 && played <= (now - (previous?.at ?? now)) * 2 + 10_000;
+        if (finished && !previous?.playedAt && !continuous) {
+          logger.debug(`Progress ${session.videoId} jumped past the watched mark; waiting for it to play on`);
+          setPosition(key, next);
+          return;
+        }
+        if (finished && !previous?.playedAt) {
+          next.playedAt = now;
+          setPosition(key, next);
+          await settle(userUUID, config, profileKey(config), session, 'stop', positionMs, true);
+          return;
+        }
+        if (!finished) {
+          await recordPlaystate(userUUID, profileKey(config), session, 'start', positionMs, null, config);
+          if (previous?.playedAt) next.rewound = true;
+        } else if (previous?.rewound) {
+          await recordPlaystate(userUUID, profileKey(config), session, 'stop', positionMs, true, config);
+          next.rewound = false;
+        }
         next.writtenAt = now;
         next.writtenMs = positionMs;
       }
@@ -680,8 +878,8 @@ export async function recordUserData(req: any, body: any): Promise<{ played: boo
     return { played, positionMs: 0 };
   }
 
-  const positionMs = ticksToMs(body?.PlaybackPositionTicks ?? body?.playbackPositionTicks);
-  if (positionMs === null) {
+  const asked = ticksToMs(body?.PlaybackPositionTicks ?? body?.playbackPositionTicks);
+  if (asked === null) {
     logger.debug(`User data for ${itemId} carries neither Played nor a position: ${Object.keys(body || {}).join(',') || 'empty body'} (${req.get?.('content-type') || 'no content type'})`);
     return null;
   }
@@ -695,11 +893,15 @@ export async function recordUserData(req: any, body: any): Promise<{ played: boo
     logger.debug(`No playable session for ${itemId}`);
     return null;
   }
+  const positionMs = require('./resume').belowResumeFloor(asked, session.runtimeMs ?? 0) ? 0 : asked;
 
   const { profileKey } = require('./profiles');
   const profile = profileKey(config);
   deletePosition(`${userUUID}:${profile}:${itemId}`);
   await upsertPlaystateEverywhere(userUUID, session.videoId, { positionMs, runtimeMs: session.runtimeMs ?? 0, ...(positionMs > 0 ? { lastPlayedAt: Date.now() } : {}), origin: 'server' }, profile, session.aliases);
+  announce(userUUID, config, profile, session).catch((error: any) =>
+    logger.debug(`User data push failed for ${session.videoId}: ${error?.message || error}`)
+  );
 
   const { invalidateResume } = require('./resume');
   invalidateResume(userUUID);

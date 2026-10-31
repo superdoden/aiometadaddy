@@ -30,6 +30,7 @@ const DETAIL_COMMON_KEYS = [
   'last_air_date',
   'status',
   'origin_country',
+  'tagline',
   'vote_average',
   'vote_count',
   'popularity',
@@ -224,6 +225,8 @@ function normalizeTmdbDetailCommonForCache(detail: any) {
   if (detail.production_countries !== undefined) {
     normalized.production_countries = mapIfArray(detail.production_countries, normalizeTmdbProductionCountryForCache);
   }
+  if (detail.production_companies !== undefined) normalized.production_companies = mapIfArray(detail.production_companies, (company: any) => pickDefined(company, ['name']));
+  if (detail.networks !== undefined) normalized.networks = mapIfArray(detail.networks, (network: any) => pickDefined(network, ['name']));
   if (detail.external_ids !== undefined) normalized.external_ids = normalizeTmdbExternalIdsForCache(detail.external_ids);
   if (detail.images !== undefined) normalized.images = normalizeTmdbImagesForCache(detail.images);
   if (detail.credits !== undefined) normalized.credits = normalizeTmdbCreditsForCache(detail.credits);
@@ -253,7 +256,7 @@ export function normalizeTmdbTvDetailForCache(series: any) {
   return normalizeTmdbDetailCommonForCache(series);
 }
 
-const RECOMMENDATION_KEYS = ['id', 'title', 'name', 'poster_path', 'backdrop_path', 'release_date', 'first_air_date', 'overview', 'vote_average', 'genre_ids'];
+const RECOMMENDATION_KEYS = ['id', 'title', 'name', 'original_language', 'poster_path', 'backdrop_path', 'release_date', 'first_air_date', 'overview', 'vote_average', 'genre_ids'];
 
 /** A recommendation row is only ever turned into a card, so only what a card shows is kept. */
 export function normalizeTmdbRecommendationsForCache(page: any) {
@@ -266,8 +269,8 @@ export function normalizeTmdbRecommendationsForCache(page: any) {
 }
 
 const PERSON_RESULT_KEYS = ['id', 'name', 'profile_path', 'popularity', 'known_for_department'];
-const PERSON_KEYS = ['id', 'name', 'profile_path', 'biography', 'birthday', 'deathday', 'place_of_birth', 'popularity', 'known_for_department'];
-const CREDIT_KEYS = [...RECOMMENDATION_KEYS, 'character', 'job', 'vote_count', 'popularity'];
+const PERSON_KEYS = ['id', 'imdb_id', 'name', 'profile_path', 'biography', 'birthday', 'deathday', 'place_of_birth', 'popularity', 'known_for_department'];
+const CREDIT_KEYS = [...RECOMMENDATION_KEYS, 'character', 'job', 'department', 'vote_count', 'popularity'];
 
 export function normalizeTmdbPersonSearchForCache(page: any) {
   if (!page || typeof page !== 'object') return page;

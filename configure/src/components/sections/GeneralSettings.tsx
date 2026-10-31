@@ -27,6 +27,12 @@ import {
 } from '@/lib/watchTracking';
 
 import { languageOptions } from '@/data/languages';
+import { ratingCountryCodes } from '@/data/ratingCountries';
+
+const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
+const ratingCountryOptions = ratingCountryCodes
+  .map(code => ({ value: code, label: regionNames.of(code) || code }))
+  .sort((a, b) => a.label.localeCompare(b.label));
 
 const castCountOptions = [
     { value: 0, label: '0 Members' },
@@ -135,6 +141,10 @@ export function GeneralSettings() {
     setConfig(prevConfig => ({ ...prevConfig, hideErrors: checked ? undefined : true }));
   };
 
+  const handleCriticRatingsChange = (checked: boolean) => {
+    setConfig(prevConfig => ({ ...prevConfig, criticRatings: checked ? true : undefined }));
+  };
+
   const handleCastCountChange = (value: string) => {
     const count = parseInt(value, 10);
     setConfig(prevConfig => ({ ...prevConfig, castCount: count === -1 ? undefined : count }));
@@ -142,6 +152,10 @@ export function GeneralSettings() {
 
   const handleDisplayAgeRatingChange = (checked: boolean) => {
     setConfig(prevConfig => ({ ...prevConfig, displayAgeRating: checked }));
+  };
+
+  const handleContentRatingCountryChange = (value: string) => {
+    setConfig(prevConfig => ({ ...prevConfig, contentRatingCountry: value === 'auto' ? undefined : value }));
   };
 
   const handleMDBListTrackingChange = (checked: boolean) => {
@@ -297,6 +311,14 @@ export function GeneralSettings() {
               <Switch id="show-errors" checked={config.hideErrors !== true} onCheckedChange={handleHideErrorsChange} />
             </div>
 
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 p-3 rounded-lg hover:bg-accent/50 transition-colors">
+              <div className="min-w-[12rem] flex-1">
+                <Label htmlFor="critic-ratings" className="font-medium">Critic Ratings</Label>
+                <p className="text-sm text-muted-foreground">Add Rotten Tomatoes, Metacritic, Letterboxd, Roger Ebert, Trakt, TMDB and MyAnimeList scores to titles, for apps that show them. Most apps ignore them, so leave this off unless yours reads them.</p>
+              </div>
+              <Switch id="critic-ratings" checked={config.criticRatings === true} onCheckedChange={handleCriticRatingsChange} />
+            </div>
+
             <div className="space-y-3 p-3 rounded-lg">
               <div>
                 <Label className="font-medium">Catalog Type Labels</Label>
@@ -329,6 +351,25 @@ export function GeneralSettings() {
               </div>
               <Switch id="display-age-rating" checked={config.displayAgeRating} onCheckedChange={handleDisplayAgeRatingChange} />
             </div>
+            {config.displayAgeRating && (
+              <div className="ml-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-r-lg border-l border-border p-3 pl-4 hover:bg-accent/50 transition-colors">
+                <div className="min-w-[12rem] flex-1">
+                  <Label htmlFor="content-rating-country" className="font-medium">Rating Country</Label>
+                  <p className="text-sm text-muted-foreground">Which country's rating the age rating shows.</p>
+                </div>
+                <Select value={config.contentRatingCountry || 'auto'} onValueChange={handleContentRatingCountryChange}>
+                  <SelectTrigger id="content-rating-country" className="w-full sm:w-[240px] shrink-0">
+                    <SelectValue placeholder="Same as display language" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Same as display language</SelectItem>
+                    {ratingCountryOptions.map(opt => (
+                      <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -357,9 +398,13 @@ export function GeneralSettings() {
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 p-3 rounded-lg hover:bg-accent/50 transition-colors">
               <div className="min-w-[12rem] flex-1">
                 <Label htmlFor="show-rate-me-button" className="font-medium">Show Rate Me Button</Label>
-                <p className="text-sm text-muted-foreground">Display a rating button in meta pages.</p>
+                <p className="text-sm text-muted-foreground">
+                  {config.catalogModeOnly
+                    ? 'Catalog Mode Only leaves the rating button to the install that supplies meta.'
+                    : 'Display a rating button in meta pages.'}
+                </p>
               </div>
-              <Switch id="show-rate-me-button" checked={!!config.showRateMeButton} onCheckedChange={handleShowRateMeButtonChange} />
+              <Switch id="show-rate-me-button" checked={!!config.showRateMeButton && !config.catalogModeOnly} disabled={config.catalogModeOnly} onCheckedChange={handleShowRateMeButtonChange} />
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 p-3 rounded-lg hover:bg-accent/50 transition-colors">

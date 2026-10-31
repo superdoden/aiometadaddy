@@ -1,6 +1,9 @@
 import express from 'express';
+import { pipeline } from 'stream/promises';
+import { LRUCache } from 'lru-cache';
 import consola from 'consola';
 import { envInt } from '../../utils/envNumber';
+import { tmdbBackdropSize, tmdbLandscapeSize, tmdbLogoSize, tmdbPosterSize } from '../../utils/tmdbImageSize';
 import { mapWithConcurrency } from '../../utils/concurrency';
 import { hasAgeRatingCap } from '../../utils/ageRating';
 import { randomUUID, timingSafeEqual } from 'crypto';
@@ -16,7 +19,6 @@ import {
 import { mintToken, readToken, revokeToken } from './tokens';
 import { pinOpens, splitSecret } from './pins';
 import {
-  collectionFolder,
   EMPTY_USER_DATA,
   itemList,
   extensionInfo,
@@ -26,28 +28,35 @@ import {
   userDto,
   SERVER_NAME,
 } from './dto';
-import { buildViews, collectionTypeFor, findCatalogByViewId, getCatalogs, getSearchableCatalogs, isBoxSetCatalog, isBrowsable, requiresGenre, viewTypeFor } from './views';
+import { buildViews, catalogView, collectionTypeFor, findCatalogByViewId, getCatalogs, getSearchableCatalogs, isBoxSetCatalog, isBrowsable, requiresGenre, rowFor } from './views';
 import { decodeJellyfinId } from './ids';
 import { artTag, imageTag, isWideTag } from './imageTags';
-import { buildEpisodes, buildSeasons, withSeasonAnimeIds, fetchCatalogPage, fetchMeta, fetchWindow, filterByIncludeTypes, includeTypesFilter, buildEpisode, findEpisodeVideo, knownCatalogLength, metaToBaseItem, pageChildren, pageEpisodes, recallArt, recallImages, rememberImages, sortNameFor, warmCatalogLengths, isLandscapeCatalog, showLandscape } from './items';
+import { buildEpisodes, buildSeasons, withSeasonAnimeIds, fetchCatalogPage, fetchMeta, fetchWindow, servedOrder, filterByIncludeTypes, includeTypesFilter, buildEpisode, findEpisodeVideo, knownCatalogLength, metaToBaseItem, pageChildren, pageEpisodes, recallArt, recallImages, rememberArt, rememberImages, sortNameFor, warmCatalogLengths, isLandscapeCatalog, showLandscape } from './items';
 import { dashedGuid, encodeJellyfinId, normaliseJellyfinId, parseStremioId, stremioIdFor } from './ids';
 import { coalesce, fetchStreams, fileFor, languageCode, languageName, mediaSourceFor, normaliseStreamBase, forgetDuration, placeholderMediaSource, recallDuration, recallFailure, recallIssued, recallStreams, rememberDuration, rememberFailure, rememberStreams, runtimeTicksFrom, streamClient, streamsState, streamUserAgent, toNotice, toPlayable, type StreamClient } from './streams';
 import { fetchAddonSubtitles, formatOf, pickSubtitles, recallOffered, rememberOffered, subtitleBody, subtitleCodecFor, subtitleExtensionOf, subtitleFormatFor, subtitleLanguage, type SubtitleTrack } from './subtitles';
 import { memoNextUp, resumeSnapshot, resumeUserData } from './resume';
+import { animeSequels } from './sequels';
 import { isAnimeTitle, showIdentity } from './canonicalIds';
 import { keepsAnimeOnly, sourceFor } from './trackerSource';
 import { refreshSeriesIndex, seriesIndex, warmSeriesIndex } from './episodeIndex';
 import { authorizeQuickConnect, claimQuickConnect, initiateQuickConnect, quickConnectResult, readQuickConnect } from './quickConnect';
+import { playbackAllowed, viewingTimeZone } from './viewingHours';
 import { avatarTag, keepsUnderProfileCap, listProfiles, profileById, profileByName, profileByUserId, profileKey, profileTags, scopeConfigToProfile, type Profile } from './profiles';
 import { malEpisodeFor, segmentId, segmentsFor, type SegmentType } from './segments';
-import { personByName, personCredits, previewMeta, similarTitles } from './people';
+import { hasCreditDate, personByName, personCredits, resolvePerson, similarTitles } from './people';
+import { titleCards } from '../titleCards';
 import { allBoxSets, boxSetGenres, boxSetMembers, boxSetsDeep, boxSetsFor, boxSetsUnder, collectionById, collectionView, folderById } from './collections';
-import { favouriteEntries, setFavourite, setWatchlisted, watchlistEntries, watchlistItems } from './watchlist';
-import { applyRatings, applyWatchedState, finishedSeries, ownNextUpRows, seriesCountsAmong, upcomingFollowed, watchedAmong, watchedHistory, watchedSnapshot, type NextUpRow } from './watched';
+import { entryItemType, setWatchlisted, watchlistEntries, watchlistItems } from './watchlist';
+import { applyRatings, applyWatchedState, finishedSeries, ownNextUpRows, seriesCountsAmong, upcomingFollowed, watchedAmong, watchedHistory, watchedSnapshot, type NextUpRow, type UpcomingRow } from './watched';
 import { cachedArtwork } from './artwork';
-import { SIZED_WIDTH, resizeToWidth, widthStep } from '../posterCache/resize';
+import { oneIdAsked, withCriticRatings } from './criticRatings';
+import { ImageQueueFull, SIZED_WIDTH, imageQueueFull, inImageSlot, shrinkToWidth, widthStep } from '../posterCache/resize';
+import { IMAGE_CSP } from '../posterCache/proxyResponse';
 import { registerStubs } from './stubs';
-import { recordPlayed, recordPlayedUpTo, recordPlaying, recordProgress, recordStopped, recordUnplayed, recordUserData, sessionTouchDue, touchSessions } from './playstate';
+import { noteWantsPeople } from './viewer';
+import { decodeCursor, exportRow, findUser, historyPage, historyUsers, isEpisodeVideo, itemIdForVideo, userByKey, videoIdsOf } from './history';
+import { forgetUserSettings, liveSessionsFor, recordPlayed, recordPlayedUpTo, recordPlaying, recordProgress, recordStopped, recordUnplayed, recordUserData, sessionTouchDue, touchSessions, type LiveSession } from './playstate';
 
 const database: any = require('../database');
 
@@ -63,6 +72,11 @@ function streamNoticesOffered(): boolean {
 
 function encodeSeriesId(descriptor: any): string {
   return encodeJellyfinId({ k: 'series', t: descriptor.t, i: descriptor.i });
+}
+
+/** A show's episodes from the meta in hand, for seasons counted before the show is indexed. */
+function seriesVideosOf(meta: any): Map<string, any[]> {
+  return new Map(meta?.id && Array.isArray(meta.videos) ? [[String(meta.id), meta.videos]] : []);
 }
 
 /**
@@ -99,11 +113,62 @@ async function locateEpisode(episodes: any[], videoId: string, mediaType: string
   );
 }
 
+async function videoForEpisode(meta: any, descriptor: any): Promise<any | null> {
+  const direct = findEpisodeVideo(meta, descriptor);
+  if (direct) return direct;
+  const { stremioIdFor } = require('./idsCodec');
+  const { videoIdAliases } = require('./aliases');
+  const videoId = stremioIdFor(descriptor);
+  if (!videoId) return null;
+  const wanted = new Set<string>([videoId, ...(await videoIdAliases(videoId))]);
+  return (Array.isArray(meta?.videos) ? meta.videos : []).find((video: any) => wanted.has(String(video?.id))) ?? null;
+}
+
+async function episodeForDescriptor(episodes: any[], descriptor: any, wanted: string, metaId: string): Promise<any | undefined> {
+  const exact = episodes.find((episode: any) => episode.Id === wanted);
+  if (exact) return exact;
+  const { stremioIdFor } = require('./idsCodec');
+  const videoId = stremioIdFor(descriptor);
+  if (videoId) {
+    const linked = await locateEpisode(episodes, videoId, descriptor.t, metaId);
+    if (linked) return linked;
+  }
+  return episodes.find((episode: any) => episode.IndexNumber === descriptor.e && episode.ParentIndexNumber === descriptor.s);
+}
+
+// The episode a video id names, built alone when it names one exactly; anything
+// looser builds the series and locates as locateEpisode always has.
+async function locateOneEpisode(meta: any, mediaType: string, seriesId: string, serverId: string, videoId: string): Promise<any | undefined> {
+  const parsed = parseStremioId(videoId);
+  if (parsed) {
+    const descriptor: any = { k: 'episode', t: mediaType, i: parsed.base, s: parsed.season, e: parsed.episode as number };
+    const video = findEpisodeVideo(meta, descriptor);
+    if (video) {
+      const episode = buildEpisode(meta, video, mediaType, seriesId, serverId);
+      if (episode.Id === encodeJellyfinId(descriptor)) return episode;
+    }
+  }
+  return locateEpisode(buildEpisodes(meta, mediaType, seriesId, serverId, null), videoId, mediaType, String(meta.id));
+}
+
+// Builds only the episode an id names; anything short of an exact match builds
+// the whole series and matches as episodeForDescriptor always has.
+async function episodeItemFor(meta: any, descriptor: any, seriesId: string, serverId: string, wanted: string): Promise<any | undefined> {
+  const video = findEpisodeVideo(meta, descriptor);
+  if (video) {
+    const episode = buildEpisode(meta, video, descriptor.t, seriesId, serverId);
+    if (episode.Id === wanted) return episode;
+  }
+  const episodes = buildEpisodes(meta, descriptor.t, seriesId, serverId, null);
+  return episodeForDescriptor(episodes, descriptor, wanted, String(meta.id));
+}
+
 // An anime episode's id names its own entry; the library may group the show under an IMDb id.
 async function seriesForEpisode(userUUID: string, config: any, descriptor: any): Promise<{ meta: any; seriesId: string } | null> {
   const idMapper: any = require('../id-mapper');
   const perEntry = /^(kitsu|mal|anilist|anidb):/.test(String(descriptor.i));
-  const grouped = perEntry && config?.providers?.anime !== 'kitsu' && config?.providers?.anime !== 'mal';
+  const { perEntryAnime } = require('./watchlistSources');
+  const grouped = perEntry && !perEntryAnime(config);
   if (grouped) {
     const numeric = parseInt(String(descriptor.i).split(':')[1], 10);
     const mapping = String(descriptor.i).startsWith('kitsu:') ? idMapper.getMappingByKitsuId(numeric)
@@ -113,13 +178,119 @@ async function seriesForEpisode(userUUID: string, config: any, descriptor: any):
     const imdb = mapping?.imdb_id;
     if (imdb) {
       const meta = await fetchMeta(userUUID, 'series', String(imdb));
-      if (meta && findEpisodeVideo(meta, descriptor)) {
+      if (meta && (await videoForEpisode(meta, descriptor))) {
         return { meta, seriesId: encodeJellyfinId({ k: 'series', t: descriptor.t, i: String(meta.id) }) };
       }
     }
   }
   const meta = await fetchMeta(userUUID, 'series', descriptor.i);
   return meta ? { meta, seriesId: encodeSeriesId(descriptor) } : null;
+}
+
+async function nowPlayingItem(userUUID: string, config: any, serverId: string, itemId: string): Promise<any | null> {
+  const descriptor = await decodeJellyfinId(itemId);
+  if (descriptor?.k === 'movie') {
+    const meta = await fetchMeta(userUUID, 'movie', descriptor.i);
+    if (!meta) return null;
+    const item = metaToBaseItem(meta, descriptor.t, serverId, null);
+    item.Id = normaliseJellyfinId(itemId);
+    return item;
+  }
+  if (descriptor?.k !== 'episode') return null;
+  const found = await seriesForEpisode(userUUID, config, descriptor);
+  if (!found) return null;
+  const wanted = normaliseJellyfinId(itemId);
+  return (await episodeItemFor(found.meta, descriptor, found.seriesId, serverId, wanted)) ?? null;
+}
+
+type ActivityCounts = { byKey: Map<string, any>; favourites: Map<string, number> };
+
+const activityMemo = new LRUCache<string, Promise<ActivityCounts>>({ max: envInt('JELLYFIN_RESUME_CACHE_MAX', 500, 1) });
+
+/**
+ * The Activity page's counts, held for a while: the apps ask every few seconds
+ * while it is open, and counting folds every row a history holds.
+ */
+function activityCounts(userUUID: string, config: any): Promise<ActivityCounts> {
+  const held = activityMemo.get(userUUID);
+  if (held) return held;
+  const work = (async (): Promise<ActivityCounts> => {
+    const byKey: Map<string, any> = await require('./dashboard').playCounts(userUUID);
+    const owners = historyUsers(config, userUUID, null).filter((user) => user.owns);
+    const favourites = new Map<string, number>();
+    for (const user of owners) {
+      const scoped = scopeConfigToProfile({ ...config }, userUUID, user.profile.id);
+      scoped.userUUID = userUUID;
+      favourites.set(user.key, (await watchlistEntries(userUUID, scoped).catch(() => ({ entries: [] }))).entries.length);
+    }
+    return { byKey, favourites };
+  })();
+  activityMemo.set(userUUID, work, { ttl: envInt('JELLYFIN_ACTIVITY_COUNTS_TTL', 300, 10) * 1000 });
+  work.catch(() => activityMemo.delete(userUUID));
+  return work;
+}
+
+/** What each device is playing, from its last progress report, as a Jellyfin session carries it. */
+async function withNowPlaying(userUUID: string, config: any, serverId: string, sessions: any[]): Promise<void> {
+  const profile = profileKey(config);
+  const window = envInt('JELLYFIN_DASHBOARD_LIVE_SECONDS', 120, 10) * 1000;
+  const now = Date.now();
+  const playing = new Map<string, LiveSession>();
+  for (const live of await liveSessionsFor(userUUID)) {
+    if (live.profile !== profile || !live.device || now - live.at > window) continue;
+    if (!playing.has(live.device)) playing.set(live.device, live);
+  }
+  await Promise.all(sessions.map(async (session) => {
+    const live = playing.get(String(session.DeviceId));
+    if (!live) return;
+    const item = await nowPlayingItem(userUUID, config, serverId, live.itemId).catch(() => null);
+    if (!item) return;
+    session.NowPlayingItem = item;
+    session.PlayState = playStateOf(live);
+  }));
+}
+
+function playStateOf(live: LiveSession): any {
+  return {
+    PositionTicks: live.positionMs * 10000,
+    CanSeek: true,
+    IsPaused: live.paused,
+    IsMuted: false,
+    PlayMethod: 'DirectStream',
+    RepeatMode: 'RepeatNone',
+    PlaybackOrder: 'Default',
+    ...(live.playSession ? { PlaySessionId: live.playSession } : {}),
+  };
+}
+
+/** What every user of the account is playing now, one session per device. */
+async function playingSessions(userUUID: string, config: any, serverId: string): Promise<any[]> {
+  const window = envInt('JELLYFIN_DASHBOARD_LIVE_SECONDS', 120, 10) * 1000;
+  const now = Date.now();
+  const seen = new Set<string>();
+  const live = (await liveSessionsFor(userUUID)).filter((s) => {
+    if (!s.device || now - s.at > window || seen.has(`${s.profile}|${s.device}`)) return false;
+    seen.add(`${s.profile}|${s.device}`);
+    return true;
+  });
+  const sessions = await Promise.all(live.map(async (s) => {
+    const viewer = profileById(config, userUUID, s.viewer ?? (s.profile || null));
+    const scoped = scopeConfigToProfile({ ...config }, userUUID, viewer.id);
+    scoped.userUUID = userUUID;
+    const item = await nowPlayingItem(userUUID, scoped, serverId, s.itemId).catch(() => null);
+    if (!item) return null;
+    const client = { client: s.app?.client ?? 'Unknown', device: s.app?.device ?? 'Unknown', deviceId: s.device!, version: s.app?.version ?? '0.0.0' };
+    return { ...sessionInfo(viewer.userId, serverId, viewer.name, client), NowPlayingItem: item, PlayState: playStateOf(s) };
+  }));
+  return sessions.filter(Boolean);
+}
+
+/** An episode its meta does not list yet, built from the tracker's air date. */
+function episodeFromDate(meta: any, row: { videoId: string | null; episode: number; mediaType: string }, released: string, seriesId: string, serverId: string): any {
+  const host = process.env.HOST_NAME?.startsWith('http') ? process.env.HOST_NAME : `https://${process.env.HOST_NAME}`;
+  const thumbnail = meta.background || (Date.parse(released) <= Date.now() ? `${host}/missing_thumbnail.png` : null);
+  const video = { ...(row.videoId ? { id: row.videoId } : {}), episode: row.episode, released, ...(thumbnail ? { thumbnail } : {}) };
+  return buildEpisode(meta, video, row.mediaType, seriesId, serverId);
 }
 
 function localAddress(req: any): string {
@@ -167,6 +338,7 @@ async function playedPick(req: any, userUUID: string, config: any, type: string,
 function userFor(profile: Profile, serverId: string, configuration?: any): any {
   const user = userDto(profile.userId, serverId, profile.name, avatarTag(profile));
   if (configuration && typeof configuration === 'object') user.Configuration = { ...user.Configuration, ...configuration };
+  if (profile.downloads === false) user.Policy = { ...user.Policy, EnableContentDownloading: false };
   return user;
 }
 
@@ -208,6 +380,40 @@ function landingPage(req: any): string {
 
 const streamCacheKey = (userUUID: string, profile: string, type: string, id: string, client?: StreamClient): string =>
   `${userUUID}:${profile}:${type}:${id}:${client?.tag ?? ''}`;
+
+export type NextUpSource = 'server' | 'tracker' | 'sequel';
+
+export interface NextUpStep {
+  outcome: 'shown' | 'caught-up' | 'airs-later' | 'no-air-date' | 'missing-episode' | 'no-meta' | 'finished' | 'dropped' | 'not-anime' | 'rating-cap' | 'duplicate';
+  next?: { season: number | null; number: number | null; name: string | null };
+  from?: { season: number | null; number: number | null; name: string | null };
+  airsAt?: number;
+  episodes?: number;
+  watched?: number;
+  total?: number;
+  meta?: any;
+}
+
+type NextUpTrace = (row: any, source: NextUpSource, step: NextUpStep) => void;
+
+let nextUpTracer: ((userUUID: string, config: any, trace: NextUpTrace) => Promise<any[]>) | null = null;
+let calendarReader: ((userUUID: string, config: any, from: number, to: number) => Promise<any[]>) | null = null;
+
+export async function readCalendar(userUUID: string, config: any, from: number, to: number): Promise<any[] | null> {
+  return calendarReader ? calendarReader(userUUID, config, from, to) : null;
+}
+
+const episodeLabel = (episode: any) => ({
+  season: Number.isFinite(episode?.ParentIndexNumber) ? episode.ParentIndexNumber : null,
+  number: Number.isFinite(episode?.IndexNumber) ? episode.IndexNumber : null,
+  name: episode?.Name ?? null,
+});
+
+export async function explainNextUp(userUUID: string, config: any, trace: NextUpTrace): Promise<boolean> {
+  if (!nextUpTracer) return false;
+  await nextUpTracer(userUUID, config, trace);
+  return true;
+}
 
 export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): any {
   const loginRateLimit = options.loginRateLimit || ((_req: any, _res: any, next: any) => next());
@@ -263,44 +469,56 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
 
   // The official SDK parses ids as UUIDs and refuses the bare form. ServerId is
   // a plain string, but a client matches it to the Id it saw at discovery.
-  const ID_FIELD = /^(Id|ItemId|ParentId|SeriesId|SeasonId|UserId|ServerId|AlbumId|ChannelId|ParentLogoItemId|ParentBackdropItemId|ParentThumbItemId|ParentPrimaryImageItemId|Key|DisplayPreferencesId|PlaylistItemId|MediaSourceId)$/;
+  // A media source's Id stays bare, as a real server sends it: a client reads it up to the first dash.
+  const ID_FIELD = /^(Id|ItemId|ParentId|SeriesId|SeasonId|UserId|ServerId|AlbumId|ChannelId|ParentLogoItemId|ParentBackdropItemId|ParentThumbItemId|ParentPrimaryImageItemId|Key|DisplayPreferencesId|PlaylistItemId)$/;
   const BARE_GUID = /^[0-9a-f]{32}$/i;
-  const dashIds = (value: any): any => {
-    if (Array.isArray(value)) return value.map(dashIds);
-    if (!value || typeof value !== 'object') return value;
-    const out: any = {};
-    for (const [k, v] of Object.entries(value)) {
-      if (typeof v === 'string' && BARE_GUID.test(v) && (ID_FIELD.test(k) || k.endsWith('Ids'))) out[k] = dashedGuid(v);
-      else if (Array.isArray(v) && k.endsWith('Ids')) out[k] = v.map((x) => (typeof x === 'string' && BARE_GUID.test(x) ? dashedGuid(x) : x));
-      else out[k] = dashIds(v);
-    }
-    return out;
-  };
-  // An Apple client opens the YouTube app's scheme, not a web link; the web client embeds the web link.
-  const APPLE_CLIENT = /swiftfin|tvos|apple ?tv|ios|ipad|iphone/i;
-  const appTrailers = (value: any): any => {
-    if (Array.isArray(value)) return value.map(appTrailers);
-    if (!value || typeof value !== 'object') return value;
-    const out: any = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = k === 'RemoteTrailers' && Array.isArray(v)
-        ? v.map((t: any) => (typeof t?.Url === 'string' ? { ...t, Url: t.Url.replace(/^https?:\/\/(www\.)?youtube\.com\//i, 'youtube://www.youtube.com/') } : t))
-        : appTrailers(v);
-    }
-    return out;
+  // Apple TV has no browser to open a web link, so its trailers open in the YouTube app.
+  const APPLE_TV = /tvos|apple ?tv/i;
+  const youtubeApp = (trailer: any): any =>
+    typeof trailer?.Url === 'string' ? { ...trailer, Url: trailer.Url.replace(/^https?:\/\/(www\.)?youtube\.com\//i, 'youtube://www.youtube.com/') } : trailer;
+  const jsonReplacer = (appleTv: boolean) => {
+    const sources = new WeakSet<object>();
+    return function (this: any, key: string, value: any): any {
+      if (typeof value === 'string') {
+        return BARE_GUID.test(value) && (ID_FIELD.test(key) || key.endsWith('Ids')) && !(key === 'Id' && sources.has(this)) ? dashedGuid(value) : value;
+      }
+      if (!value || typeof value !== 'object') return value;
+      if (key === 'MediaSources') {
+        for (const source of Array.isArray(value) ? value : [value]) if (source && typeof source === 'object') sources.add(source);
+        return value;
+      }
+      if (!Array.isArray(value)) return value;
+      if (key.endsWith('Ids')) return value.map((x) => (typeof x === 'string' && BARE_GUID.test(x) ? dashedGuid(x) : x));
+      if (appleTv && key === 'RemoteTrailers') return value.map(youtubeApp);
+      return value;
+    };
   };
 
   const seenClients = new Set<string>();
   router.use((req: any, res: any, next: any) => {
-    const json = res.json.bind(res);
     const info = clientInfo(req);
     const label = `${info.client} | ${info.device}`;
     if (!seenClients.has(label) && info.client !== 'Unknown') {
       seenClients.add(label);
       logger.info(`Client seen: ${label} (${info.version})`);
     }
-    const apple = APPLE_CLIENT.test(info.client) || APPLE_CLIENT.test(info.device);
-    res.json = (body: any) => json(dashIds(apple ? appTrailers(body) : body));
+    const started = Date.now();
+    res.on('finish', () => {
+      const from = info.client !== 'Unknown' ? `${label} (${info.version})` : `ua ${req.get('user-agent') || 'none'}`;
+      logger.debug(`${req.method} ${String(req.originalUrl || '').split('?')[0]} ${res.statusCode} ${Date.now() - started}ms from ${from}`);
+    });
+    const appleTv = APPLE_TV.test(info.client) || APPLE_TV.test(info.device);
+    const send = (body: any) => {
+      if (res.headersSent) return res;
+      if (!res.get('Content-Type')) res.set('Content-Type', 'application/json');
+      return res.send(JSON.stringify(body, jsonReplacer(appleTv)));
+    };
+    res.json = (body: any) => {
+      const rating = res.statusCode < 300 ? withCriticRatings(body, oneIdAsked(req.query)) : null;
+      if (!rating) return send(body);
+      rating.then(() => send(body), () => send(body));
+      return res;
+    };
     next();
   });
 
@@ -476,25 +694,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     res.json({ ...systemInfo(serverIdFor(req.params.userUUID), baseFor(req)), aiostreams: extensionInfo(localAddress(req)) });
   });
 
-  // Every user of a configuration signs in with its one password. The main user sees
-  // everything, so it switches freely; any other user, who may be held to a rating or
-  // to some catalogs, gives the password again to become someone else. A user with a
-  // PIN asks for it on every switch, from the main user too.
-  type Secret = 'pin' | 'password' | 'password-pin';
-  const switchNeeds = (req: any, target: Profile): Secret | null => {
-    const callerId = req.jellyfin?.profileId ?? null;
-    if (callerId === target.id) return null;
-    if (callerId === null) return target.pin ? 'pin' : null;
-    return target.pin ? 'password-pin' : 'password';
-  };
-
-  const secretOpens = async (userUUID: string, target: Profile, needs: Secret, secret: string): Promise<boolean> => {
-    if (needs === 'pin') return pinOpens(userUUID, target, secret);
-    if (needs === 'password') return Boolean(await configForPassword(userUUID, secret));
-    const slash = secret.lastIndexOf('/');
-    if (slash <= 0) return false;
-    return Boolean(await configForPassword(userUUID, secret.slice(0, slash))) && pinOpens(userUUID, target, secret.slice(slash + 1));
-  };
+  // Every user of a configuration signs in with its one password, so a session has
+  // already proved it and only a PIN tells users apart. A user with a PIN asks for it on
+  // every switch, back to itself too, or handing over a signed-in device would hand it over.
+  type Secret = 'pin';
+  const switchNeeds = (_req: any, target: Profile): Secret | null => (target.pin ? 'pin' : null);
 
   router.get('/AIOStreams/Users', async (req: any, res: any) => {
     const userUUID = req.params.userUUID;
@@ -521,18 +725,165 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return;
     }
     const needs = switchNeeds(req, profile);
-    if (needs && !(await secretOpens(userUUID, profile, needs, String(req.body?.Pw ?? '')))) {
+    if (needs && !(await pinOpens(userUUID, profile, String(req.body?.Pw ?? '')))) {
       res.status(401).json({ Message: 'Invalid password' });
       return;
     }
     await signIn(req, res, userUUID, config, profile);
   });
 
+  router.get('/AIOStreams/Activity', async (req: any, res: any) => {
+    const userUUID = req.params.userUUID;
+    const config = await database.getUserConfig(userUUID).catch(() => null);
+    if (!config) {
+      res.json({ users: [], sessions: [] });
+      return;
+    }
+    const serverId = serverIdFor(userUUID);
+    const caller = req.jellyfin?.profileId ?? null;
+    const users = historyUsers(config, userUUID, caller);
+    const [{ byKey, favourites }, sessions] = await Promise.all([
+      activityCounts(userUUID, config),
+      caller ? Promise.resolve([]) : playingSessions(userUUID, config, serverId),
+    ]);
+    const main = listProfiles(config, userUUID)[0];
+    res.json({
+      users: users.map((user) => {
+        const row: any = byKey.get(user.key);
+        return {
+          user: userFor(user.profile, serverId),
+          avatar: user.profile.avatar,
+          hidden: false,
+          locked: Boolean(user.profile.pin),
+          historyOf: dashedGuid(user.key ? user.profile.userId : main.userId),
+          counts: user.owns
+            ? { played: row?.played ?? 0, movies: row?.movies ?? 0, episodes: row?.episodes ?? 0, inProgress: row?.inProgress ?? 0, favorites: favourites.get(user.key) ?? 0, lastAt: row?.lastAt ?? null }
+            : null,
+        };
+      }),
+      sessions,
+    });
+  });
+
+  router.get('/AIOStreams/History', async (req: any, res: any) => {
+    const userUUID = req.params.userUUID;
+    const config = await loadConfig(req);
+    const stored = await database.getUserConfig(userUUID).catch(() => null);
+    if (!config || !stored) {
+      res.json({ items: [], cursor: null });
+      return;
+    }
+    const users = historyUsers(stored, userUUID, req.jellyfin?.profileId ?? null);
+    const asked = req.query.userId ?? req.query.UserId;
+    const scoped = asked ? findUser(users, asked) : undefined;
+    if (asked && !scoped) {
+      res.status(404).json({ Message: 'User not found' });
+      return;
+    }
+    const owners = userByKey(users);
+    const keys = scoped ? [scoped.key] : [...owners.keys()];
+    const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? req.query.Limit ?? 50), 10) || 50), 200);
+    const localOnly = String(req.query.source ?? '') === 'local';
+    const serverId = serverIdFor(userUUID);
+    const { entries, cursor } = await historyPage(
+      (take, after) => database.listHistoryRows(userUUID, keys, { limit: take, after, localOnly }),
+      (candidates) => mapWithConcurrency(candidates, envInt('JELLYFIN_DASHBOARD_DESCRIBE_CONCURRENCY', 8, 1), (entry) =>
+        nowPlayingItem(userUUID, config, serverId, itemIdForVideo(entry.videoId)).catch(() => null)
+      ),
+      limit,
+      decodeCursor(req.query.cursor)
+    );
+    res.json({
+      items: entries.map((entry) => {
+        const episode = isEpisodeVideo(entry.videoId);
+        const { profile, videoId, item, ...rest } = entry;
+        return {
+          userId: dashedGuid((owners.get(profile) ?? users[0]).profile.userId),
+          kind: episode ? 'episode' : 'movie',
+          favorite: false,
+          ...rest,
+          item: item ?? { Id: itemIdForVideo(videoId), Name: videoId, Type: episode ? 'Episode' : 'Movie' },
+        };
+      }),
+      cursor,
+    });
+  });
+
+  // Local only: a tracker that still lists a title brings it back on its next sync.
+  router.post('/AIOStreams/History/Clear', async (req: any, res: any) => {
+    const userUUID = req.params.userUUID;
+    const stored = await database.getUserConfig(userUUID).catch(() => null);
+    const users = stored ? historyUsers(stored, userUUID, req.jellyfin?.profileId ?? null) : [];
+    const user = findUser(users, req.body?.userId ?? req.body?.UserId);
+    if (!user) {
+      res.status(404).json({ Message: 'User not found' });
+      return;
+    }
+    const keys = req.body?.itemKeys;
+    if (keys !== undefined && (!Array.isArray(keys) || !keys.length || keys.length > 1000 || keys.some((key: any) => typeof key !== 'string' || !key))) {
+      res.status(400).json({ Message: 'userId and optional itemKeys expected' });
+      return;
+    }
+    activityMemo.delete(userUUID);
+    const cleared = await database.clearHistory(userUUID, user.key, keys ? [...new Set(keys.flatMap((key: string) => videoIdsOf(key)))] : undefined);
+    const { invalidateResume } = require('./resume');
+    invalidateResume(userUUID);
+    logger.info(`Cleared ${cleared} history row(s) of ${userUUID}${user.key ? ` (${user.key})` : ''}${keys ? '' : ', all of it'}`);
+    res.json({ cleared });
+  });
+
+  // Written a page at a time, so a long history is never held whole.
+  router.get('/AIOStreams/History/Export', async (req: any, res: any) => {
+    const userUUID = req.params.userUUID;
+    const stored = await database.getUserConfig(userUUID).catch(() => null);
+    const owners = stored ? historyUsers(stored, userUUID, req.jellyfin?.profileId ?? null).filter((user) => user.owns) : [];
+    const keys = owners.map((user) => user.key);
+    res.setHeader('Content-Disposition', `attachment; filename="watch-history-${userUUID.slice(0, 8)}.json"`);
+    res.type('json');
+    let gone = false;
+    res.once('close', () => (gone = true));
+    const write = (chunk: string): Promise<void> => {
+      if (res.write(chunk)) return Promise.resolve();
+      return new Promise((resolve) => {
+        const done = () => {
+          res.off('drain', done);
+          res.off('close', done);
+          resolve();
+        };
+        res.once('drain', done);
+        res.once('close', done);
+      });
+    };
+    try {
+      const head = JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        users: owners.map((user) => ({ id: dashedGuid(user.profile.userId), profile: user.key, name: user.profile.name })),
+      });
+      await write(`${head.slice(0, -1)},"rows":[`);
+      const size = 1000;
+      let after: { profile: string; videoId: string } | undefined;
+      let first = true;
+      while (!gone) {
+        const page: any[] = await database.listPlaystatePage(userUUID, keys, size, after);
+        if (!page.length) break;
+        await write(`${first ? '' : ','}${page.map((row) => JSON.stringify(exportRow(row))).join(',')}`);
+        first = false;
+        if (page.length < size) break;
+        const last = page[page.length - 1];
+        after = { profile: String(last.profile ?? ''), videoId: String(last.video_id) };
+      }
+      res.end(']}');
+    } catch (error: any) {
+      logger.warn(`History export failed for ${userUUID}: ${error?.message || error}`);
+      res.destroy();
+    }
+  });
+
   router.post('/QuickConnect/Authorize', async (req: any, res: any) => {
     const config = await loadConfig(req);
     const asked = req.query.userId ?? req.query.UserId;
     const profile = (asked && profileByUserId(config, req.params.userUUID, asked)) || sessionProfile(req, config);
-    if (switchNeeds(req, profile)) {
+    if (profile.id !== (req.jellyfin?.profileId ?? null) && switchNeeds(req, profile)) {
       res.status(403).json({ Message: 'Switch to this user to approve a device for them' });
       return;
     }
@@ -572,6 +923,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       await database.savePreferences(userUUID, profile.id ?? '', USER_CONFIGURATION_ID, '', req.body).catch((error: any) =>
         logger.debug(`User configuration save failed: ${error?.message || error}`)
       );
+      forgetUserSettings(userUUID);
     }
     res.status(204).end();
   });
@@ -657,24 +1009,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
 
     const serverId = serverIdFor(userUUID);
 
-    // The watchlist, newest first, is what a client calls favourites; a client with a
-    // watchlist of its own asks for it by likes, and its favourites are kept apart.
+    // The watchlist, newest first, is every client's favourites; older clients ask for it by likes.
     const ownWatchlist = clientHasOwnWatchlist();
     const likesFilter = filters.split(',').map((f) => f.trim()).includes('Likes');
-    if (ownWatchlist && (filters.includes('IsFavorite') || favouriteFlag)) {
-      const wanted = includeItemTypes
-        ? new Set(String(includeItemTypes).split(',').map((t) => t.trim()).filter(Boolean))
-        : null;
-      const entries = (await favouriteEntries(userUUID, config)).filter((entry) =>
-        !wanted || wanted.has(entry.mediaType === 'movie' ? 'Movie' : 'Series')
-      );
-      const page = entries.slice(startIndex, startIndex + limit);
-      const items = await watchlistItems(userUUID, config, serverId, page, shelfConcurrency());
-      await applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config));
-      res.json(itemList(items, entries.length, startIndex));
-      return;
-    }
-    if (ownWatchlist ? likesFilter : filters.includes('IsFavorite') || favouriteFlag) {
+    if (filters.includes('IsFavorite') || favouriteFlag || (ownWatchlist && likesFilter)) {
       const started = Date.now();
       const wanted = includeItemTypes
         ? new Set(String(includeItemTypes).split(',').map((t) => t.trim()).filter(Boolean))
@@ -683,17 +1021,53 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         res.json(itemList([], 0, startIndex));
         return;
       }
+      const { watchlistOrigins } = require('./dashboard');
+      const origins = { WatchlistSources: watchlistOrigins(config) };
+      const shelved = await serverWatchlistItems(userUUID, config, serverId, wanted);
+      if (shelved) {
+        await applyWatchedState(shelved, await watchedSnapshot(userUUID, config), userUUID, profileKey(config));
+        res.json({ ...itemList(shelved.slice(startIndex, startIndex + limit), shelved.length, startIndex), ...origins, WatchlistComplete: true });
+        return;
+      }
       const read = await watchlistEntries(userUUID, config);
       const entries = read.entries.filter((entry) =>
-        !wanted || wanted.has(entry.mediaType === 'movie' ? 'Movie' : 'Series')
+        !wanted || wanted.has(entryItemType(entry))
       );
       const listed = Date.now() - started;
       const page = entries.slice(startIndex, startIndex + limit);
-      const items = await watchlistItems(userUUID, config, serverId, page, shelfConcurrency(), ownWatchlist ? 'Likes' : 'IsFavorite');
+      const items = await watchlistItems(userUUID, config, serverId, page, shelfConcurrency());
       await applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config));
       const count = read.exhausted ? entries.length : Math.max(entries.length, startIndex + items.length + limit);
       logger.debug(`Favourites for ${userUUID} from ${clientInfo(req).client}/${clientInfo(req).version}: ${items.length} of ${count}, types ${includeItemTypes ?? 'any'}, from ${startIndex}, in ${Date.now() - started}ms (entries ${listed}ms)`);
-      res.json(itemList(items, count, startIndex));
+      res.json({ ...itemList(items, count, startIndex), ...origins, WatchlistComplete: read.complete !== false });
+      return;
+    }
+
+    // Dropped shows are the disliked ones, as a dislike drops a show. Rated is not a
+    // Jellyfin filter: it lists the titles this profile rated, newest first.
+    const filterList = filters.split(',').map((f) => f.trim());
+    const library = filterList.includes('Dislikes') ? 'dropped' : filterList.includes('Rated') ? 'ratings' : null;
+    if (library) {
+      const wanted = includeItemTypes ? String(includeItemTypes).split(',').map((t) => t.trim()) : null;
+      const fits = (type: 'movie' | 'series') => !wanted || wanted.includes(type === 'movie' ? 'Movie' : 'Series');
+      const { libraryPicks } = require('./dashboard');
+      const picks = (await libraryPicks(userUUID, config, library)).filter((pick: any) => pick.types.some(fits));
+      const page = picks.slice(startIndex, startIndex + limit);
+      const built = await mapWithConcurrency(page, shelfConcurrency(), async (pick: any) => {
+        for (const type of pick.types.filter(fits)) {
+          const meta = await fetchMeta(userUUID, type, pick.metaId).catch(() => null);
+          if (!meta) continue;
+          const item = metaToBaseItem(meta, type, serverId, null);
+          if (pick.at) item.DateCreated = new Date(pick.at).toISOString();
+          else delete item.DateCreated;
+          if (library === 'dropped') item.UserData = { ...item.UserData, Likes: false };
+          return item;
+        }
+        return null;
+      });
+      const items = built.filter(Boolean).filter(keepsUnderProfileCap(config));
+      await applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config));
+      res.json(itemList(items, picks.length, startIndex));
       return;
     }
     const minPremiere = Date.parse(String(req.query.MinPremiereDate ?? req.query.minPremiereDate ?? ''));
@@ -711,10 +1085,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         return;
       }
       const withFilms = String(includeItemTypes ?? '').split(',').map((t) => t.trim()).includes('Movie');
-      const digest = (await watchedSnapshot(userUUID, config)).fingerprint;
-      const memoKey = `${userUUID}:${profileKey(config)}:calendar:${from}:${to}:${digest}${withFilms ? ':films' : ''}`;
-      const episodes = await memoNextUp(userUUID, memoKey, () => buildCalendar(userUUID, config, from, to, withFilms), (built) =>
-        built.length === 0 ? Date.now() + envInt('JELLYFIN_CALENDAR_EMPTY_TTL', 30, 1) * 1000 : null);
+      const episodes = await heldCalendar(userUUID, config, from, to, withFilms);
       const pageSize = (req.query.Limit ?? req.query.limit) === undefined ? 500 : limit;
       res.json(itemList(episodes.slice(startIndex, startIndex + pageSize), episodes.length, startIndex));
       return;
@@ -742,6 +1113,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const { groupBySpelling } = require('./aliases');
         const rows: any[] = await database.listPlaystatePlayedFor(userUUID, envInt('JELLYFIN_HISTORY_LOCAL_LIMIT', 5000, 1), profile).catch(() => []);
         const onTracker = await watchedAmong(snapshot, rows.map((row) => String(row.video_id)));
+        const finishedAt = new Map<string, number>();
+        for (const watch of await database.listWatchesFor(userUUID, profile, rows.map((row) => String(row.video_id))).catch(() => [])) {
+          finishedAt.set(watch.video_id, Math.max(finishedAt.get(watch.video_id) ?? 0, watch.watched_at));
+        }
         for (const group of (await groupBySpelling(rows)) as any[][]) {
           if (group.some((row: any) => onTracker.has(String(row.video_id)))) continue;
           const row = group.find((r: any) => String(r.video_id).startsWith('tt')) ?? group[0];
@@ -750,7 +1125,8 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
           if (!parsed) continue;
           const isEpisode = parsed.episode !== null;
           if (!kinds.has(isEpisode ? 'episode' : 'movie')) continue;
-          const at = Math.max(...group.map((r: any) => Number(r.last_played_at) || 0));
+          const finished = Math.max(0, ...group.map((r: any) => finishedAt.get(String(r.video_id)) ?? 0));
+          const at = finished || Math.max(...group.map((r: any) => Number(r.last_played_at) || 0));
           played.push(
             isEpisode
               ? { kind: 'episode', id: videoId, metaId: parsed.base, mediaType: videoId.startsWith('kitsu:') ? 'anime' : 'series', at }
@@ -787,8 +1163,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const meta = await seriesIndex(userUUID, entry.metaId);
         if (!meta) return null;
         const mediaType = entry.mediaType === 'anime' ? 'anime' : 'series';
-        const episodes = buildEpisodes(meta, mediaType, encodeJellyfinId({ k: 'series', t: mediaType, i: String(meta.id) }), serverId, null);
-        return (await locateEpisode(episodes, entry.id, mediaType, String(meta.id))) ?? null;
+        return (await locateOneEpisode(meta, mediaType, encodeJellyfinId({ k: 'series', t: mediaType, i: String(meta.id) }), serverId, entry.id)) ?? null;
       });
       const items = built.filter(Boolean);
       await applyWatchedState(items, snapshot, userUUID, profile);
@@ -884,7 +1259,8 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const asked = req.query.Limit ?? req.query.limit;
       const take = asked === undefined ? envInt('JELLYFIN_FILMOGRAPHY_PAGE', 100, 1) : limit;
       const ascending = String(req.query.SortOrder ?? req.query.sortOrder ?? '').toLowerCase().startsWith('asc');
-      const { items, total } = await personItems(userUUID, config, serverId, personIds[0], includeItemTypes, startIndex, take, ascending);
+      const personTypes = String(req.query.PersonTypes ?? req.query.personTypes ?? '').split(',').map((v) => v.trim()).filter(Boolean);
+      const { items, total } = await personItems(userUUID, config, serverId, personIds[0], includeItemTypes, personTypes, startIndex, take, ascending);
       res.json(itemList(items, total, startIndex));
       return;
     }
@@ -892,16 +1268,22 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     // Clients build search rows here, one call per section: /Search/Hints is
     // a single flat list with no way to express them.
     if (searchTerm) {
-      const found = await searchAcross(
+      const kinds = includeItemTypes ? String(includeItemTypes).split(',').map((t) => t.trim()).filter(Boolean) : [];
+      const titleKinds = kinds.filter((kind) => kind !== 'Person');
+      const people = kinds.includes('Person') ? await peopleMatching(config, serverId, String(searchTerm)) : [];
+      const titles = kinds.length && !titleKinds.length ? [] : await searchAcross(
         userUUID,
         config,
         serverId,
         String(searchTerm),
         startIndex + limit,
-        includeItemTypes
+        kinds.length ? titleKinds.join(',') : includeItemTypes
       );
+      const found = [...people, ...titles];
       const page = found.slice(startIndex, startIndex + limit);
-      await applyWatchedState(page, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
+      await applyWatchedState(page.filter((item: any) => item.Type !== 'Person'), await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config, {
+        indexWaitMs: envInt('JELLYFIN_SEARCH_INDEX_WAIT_MS', 3000, 0),
+      });
       res.json(itemList(page, found.length, startIndex));
       return;
     }
@@ -965,7 +1347,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         ).catch(() => ({ items: [] as any[], hasMore: false }));
 
         const viewId = encodeJellyfinId({ k: 'view', t: catalog.type, c: catalog.id });
-        for (const meta of page.items) {
+        for (const meta of servedOrder(page.items, page)) {
           if (!meta?.id || collected.length >= limit) continue;
           collected.push(metaToBaseItem(meta, catalog.type, serverId, viewId));
         }
@@ -1008,7 +1390,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const sortBy = String(req.query.SortBy ?? req.query.sortBy ?? '');
         const descending = String(req.query.SortOrder ?? req.query.sortOrder ?? '').toLowerCase() === 'descending';
         const applyState = async (items: any[]) =>
-          applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
+          applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config, {
+            seriesVideos: seriesVideosOf(meta),
+          });
 
         // Filtering on played judges every child, so only an unfiltered page is built alone.
         if (wantsEpisodes && !filters.includes('IsPlayed') && !filters.includes('IsUnplayed')) {
@@ -1062,7 +1446,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const ahead = children.slice(startIndex, startIndex + folderLimit);
         const titlesFrom = Math.max(0, startIndex - children.length);
         const room = folderLimit - ahead.length;
-        const page = room > 0
+        const foldersOnly = wantedTypes.length > 0 && wantedTypes.every((t) => t === 'BoxSet');
+        const page = foldersOnly
+          ? { items: [], hasMore: false }
+          : room > 0
           ? await boxSetMembers(userUUID, config, serverId, collection, folder, titlesFrom, room, includeItemTypes ? String(includeItemTypes) : undefined, extras.genre)
           : { items: [], hasMore: true };
         await applyWatchedState(page.items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
@@ -1133,7 +1520,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     );
     const hasMore = window.hasMore;
 
-    const items = window.items
+    const items = servedOrder(window.items, window)
       .filter((meta: any) => meta && meta.id)
       .map((meta: any) => metaToBaseItem(meta, catalog.type, serverId, String(parentId)));
     if (isLandscapeCatalog(config, catalog)) showLandscape(items);
@@ -1169,11 +1556,14 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   const clientFor = (req: any, config: any): StreamClient | undefined =>
     streamClient(`${req.params.userUUID}:${profileKey(config)}`, clientInfo(req), req.get?.('user-agent'));
 
+  const headerSources = new WeakSet<any>();
+
   const resolveMediaSources = async (
     req: any,
     descriptor: any,
     runtimeTicks: number | null,
-    refresh = false
+    refresh = false,
+    allowHeaders = false
   ): Promise<any[]> => {
     if (!descriptor || (descriptor.k !== 'movie' && descriptor.k !== 'episode')) return [];
 
@@ -1204,7 +1594,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const sources: any[] = [];
     const notices: any[] = [];
     for (const stream of streams) {
-      const playable = toPlayable(stream);
+      const playable = toPlayable(stream, allowHeaders);
       if (!playable) {
         if (!streamNoticesOffered()) continue;
         const notice = toNotice(stream);
@@ -1215,7 +1605,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       }
       if (seen.has(playable.id)) continue;
       seen.add(playable.id);
-      sources.push(mediaSourceFor(playable, runtimeTicks));
+      const source = mediaSourceFor(playable, runtimeTicks);
+      if (playable.needsHeaders) headerSources.add(source);
+      sources.push(source);
     }
 
     logger.debug(`Streams ${stremioType}/${stremioId}: ${streams.length} offered, ${sources.length} playable, ${notices.length} to read`);
@@ -1294,10 +1686,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const numeric = parseInt(parsed.base.split(':')[1], 10);
     const mapping =
       parsed.idType === 'kitsu' ? idMapper.getMappingByKitsuId(numeric)
-      : parsed.idType === 'mal' ? idMapper.getMappingByMalId(numeric)
+      : parsed.idType === 'mal' ? idMapper.getMappingByMalId(numeric) ?? { type: 'MOVIE', mal_id: numeric }
       : parsed.idType === 'anilist' ? idMapper.getMappingByAnilistId(numeric)
       : null;
-    const imdb = mapping?.imdb_id || (mapping?.mal_id ? idMapper.getTraktAnimeMovieByMalId?.(mapping.mal_id)?.externals?.imdb : null);
+    const imdb = idMapper.filmIdsFor(mapping).imdbId;
     return imdb ? String(imdb) : videoId;
   };
 
@@ -1410,14 +1802,15 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
    * selectable.
    */
   const withDefaultSourceId = async (sources: any[], itemId: string): Promise<any[]> => {
-    if (!sources.length) return sources;
+    const first = sources.findIndex((source) => !headerSources.has(source));
+    if (first < 0) return sources;
     const id = normaliseJellyfinId(itemId);
     // A play report then names the item, not the hash the duration sits under.
-    const ms = await recallDuration(sources[0].Id).catch(() => null);
+    const ms = await recallDuration(sources[first].Id).catch(() => null);
     if (ms) rememberDuration(id, ms);
     else forgetDuration(id);
     return sources.map((source, index) =>
-      index === 0 ? { ...source, Id: id, ETag: id } : source
+      index === first ? { ...source, Id: id, ETag: id } : source
     );
   };
 
@@ -1432,6 +1825,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     return (await decodeJellyfinId(value))?.k === 'marker' ? undefined : value;
   };
 
+  const outsideViewingHours = async (req: any): Promise<boolean> => {
+    const config = await loadConfig(req);
+    if (!config) return false;
+    return !playbackAllowed(sessionProfile(req, config).viewingHours, viewingTimeZone(config));
+  };
+
   const playbackHandler = async (req: any, res: any) => {
     const { itemId, descriptor } = await unwrapMarker(String(req.params.itemId));
 
@@ -1440,10 +1839,15 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return;
     }
 
-    const requested = await requestedSource(req.query.MediaSourceId ?? req.body?.MediaSourceId);
+    if (await outsideViewingHours(req)) {
+      res.json({ MediaSources: [], PlaySessionId: randomUUID(), ErrorCode: 'NotAllowed' });
+      return;
+    }
+
+    const requested = await requestedSource(req.query.MediaSourceId ?? req.query.mediaSourceId ?? req.body?.MediaSourceId);
     // A named version keeps the list it came from.
     const named = typeof requested === 'string' && !!requested && normaliseJellyfinId(requested) !== normaliseJellyfinId(itemId);
-    const all = await resolveMediaSources(req, descriptor, null, req.body?.Refresh === true && !named);
+    const all = await resolveMediaSources(req, descriptor, null, req.body?.Refresh === true && !named, req.body?.EnableRequiredHttpHeaders === true);
     const withIds = await withDefaultSourceId(all, itemId);
 
     let sources = withIds;
@@ -1482,7 +1886,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const index = parseInt(String(req.params.index), 10);
     const format = formatOf(String(req.params.format));
 
-    const sources = await withDefaultSourceId(await resolveMediaSources(req, descriptor, null), itemId);
+    const sources = await withDefaultSourceId(await resolveMediaSources(req, descriptor, null, false, true), itemId);
     const source = sources.find((s: any) => normaliseJellyfinId(s.Id) === normaliseJellyfinId(sourceId));
     if (!source) {
       res.status(404).end();
@@ -1525,6 +1929,18 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const { itemId, descriptor } = await unwrapMarker(String(req.params.itemId));
     if (!descriptor || (descriptor.k !== 'movie' && descriptor.k !== 'episode')) {
       res.status(404).json({ Message: 'Item not found' });
+      return;
+    }
+
+    if (/\/Download$/i.test(String(req.path))) {
+      const config = await loadConfig(req);
+      if (config && sessionProfile(req, config).downloads === false) {
+        res.status(403).json({ Message: 'Downloads are turned off for this user' });
+        return;
+      }
+    }
+    if (await outsideViewingHours(req)) {
+      res.status(403).json({ Message: 'Outside this user\'s viewing hours' });
       return;
     }
 
@@ -1637,10 +2053,19 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       PremiereDate: isoDate(person?.birthday),
       EndDate: isoDate(person?.deathday),
       ProductionLocations: person?.birthplace ? [person.birthplace] : [],
+      // Not a Jellyfin field: the PersonTypes value a filmography opens on.
+      KnownForType: person?.knownFor ?? undefined,
       ImageTags: person?.photo ? { Primary: imageTag(person.photo) } : {},
       BackdropImageTags: [],
       UserData: { ...EMPTY_USER_DATA, Key: bare, ItemId: bare },
     };
+  };
+
+  const peopleMatching = async (config: any, serverId: string, term: string): Promise<any[]> => {
+    const person = await personByName(config, term).catch(() => null);
+    if (!person) return [];
+    const id = encodeJellyfinId({ k: 'person', n: person.name, s: person.source, x: person.id });
+    return [personItem(id, serverId, person.name, person)];
   };
 
   const personItems = async (
@@ -1649,26 +2074,27 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     serverId: string,
     personId: string,
     includeItemTypes: any,
+    personTypes: string[],
     startIndex: number,
     take: number,
     ascending = false
   ): Promise<{ items: any[]; total: number }> => {
     const descriptor = await decodeJellyfinId(personId);
     if (!descriptor || descriptor.k !== 'person') return { items: [], total: 0 };
-    const person = await personByName(config, descriptor.n);
+    const person = await resolvePerson(config, descriptor);
     if (!person) return { items: [], total: 0 };
     const wanted = includeItemTypes ? String(includeItemTypes) : undefined;
-    const newest = (await personCredits(config, person.id)).filter(
-      (meta: any) => !wanted || wanted.split(',').map((t) => t.trim()).includes(meta.type === 'movie' ? 'Movie' : 'Series')
+    const newest = (await personCredits(config, person)).filter(
+      (meta: any) =>
+        (!wanted || wanted.split(',').map((t) => t.trim()).includes(meta.type === 'movie' ? 'Movie' : 'Series')) &&
+        (!personTypes.length || personTypes.some((kind) => meta._personTypes.includes(kind)))
     );
     const listed = ascending
-      ? [...newest.filter((meta: any) => meta.released).reverse(), ...newest.filter((meta: any) => !meta.released)]
+      ? [...newest.filter(hasCreditDate).reverse(), ...newest.filter((meta: any) => !hasCreditDate(meta))]
       : newest;
-    const page = await mapWithConcurrency(listed.slice(startIndex, startIndex + take), shelfConcurrency(), async (meta: any) => {
-      const card = await previewMeta(config, userUUID, meta.type, meta.id).catch(() => null);
-      return metaToBaseItem(card ?? meta, meta.type, serverId, null);
-    });
-    const items = page.filter(keepsUnderProfileCap(config));
+    const page = listed.slice(startIndex, startIndex + take);
+    const cards = await titleCards(config, userUUID, page);
+    const items = cards.map((card: any, i: number) => metaToBaseItem(card, page[i].type, serverId, null)).filter(keepsUnderProfileCap(config));
     await applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
     return { items, total: listed.length };
   };
@@ -1740,53 +2166,70 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       res.json(itemList([], 0, 0));
       return;
     }
-    const person = await personByName(config, term).catch(() => null);
-    if (!person) {
-      res.json(itemList([], 0, 0));
-      return;
-    }
-    const id = encodeJellyfinId({ k: 'person', n: person.name });
-    res.json(itemList([personItem(id, serverIdFor(req.params.userUUID), person.name, person)], 1, 0));
+    const people = await peopleMatching(config, serverIdFor(req.params.userUUID), term);
+    res.json(itemList(people, people.length, 0));
   });
+
+  const toHint = (item: any) => ({
+    ItemId: item.Id,
+    Id: item.Id,
+    Name: item.Name,
+    Type: item.Type,
+    MediaType: item.MediaType ?? 'Video',
+    ProductionYear: item.ProductionYear,
+    PrimaryImageTag: item.ImageTags?.Primary,
+    BackdropImageTag: item.BackdropImageTags?.[0],
+    BackdropImageItemId: item.Id,
+    PrimaryImageAspectRatio: item.PrimaryImageAspectRatio,
+    RunTimeTicks: item.RunTimeTicks,
+    Artists: [],
+  });
+
+  // LumiereDB's typeahead, for a search bar asking on each key press. Nothing else is
+  // fast enough to answer it, so without it there are no hints. It carries no age
+  // ratings, so a capped profile gets none either.
+  const suggestHints = async (config: any, serverId: string, term: string, limit: number, includeItemTypes: any): Promise<any[]> => {
+    const { lumiereApiBase } = require('../../utils/lumiereLists');
+    const { fetchLumiereSuggest } = require('../../utils/lumiereSearch');
+    const { getSetting } = require('../settingsService');
+    const base = lumiereApiBase();
+    if (!base || hasAgeRatingCap(config)) return [];
+
+    const wanted = includeItemTypes
+      ? new Set(String(includeItemTypes).split(',').map((t) => t.trim()).filter(Boolean))
+      : null;
+    const movies = !wanted || !wanted.size || wanted.has('Movie');
+    const shows = !wanted || !wanted.size || wanted.has('Series');
+    if (!movies && !shows) return [];
+
+    const timeoutMs = parseInt(getSetting('LUMIERE_SUGGEST_TIMEOUT_MS'), 10) || 1500;
+    const found = await fetchLumiereSuggest(base, movies && shows ? null : movies ? 'movie' : 'series', term, limit, !!config.includeAdult, timeoutMs);
+    // Metahub's poster, kept by its tag alone so it never replaces the title's own art.
+    return (found ?? []).map((title: any) => {
+      const item = metaToBaseItem({ id: title.imdbId, type: title.kind, name: title.title, releaseInfo: title.year ? String(title.year) : undefined }, title.kind, serverId, null);
+      const poster = `https://images.metahub.space/poster/medium/${title.imdbId}/img`;
+      rememberArt(poster);
+      item.ImageTags = { ...item.ImageTags, Primary: imageTag(poster) };
+      return item;
+    });
+  };
 
   router.get('/Search/Hints', async (req: any, res: any) => {
     const term = String(req.query.SearchTerm ?? req.query.searchTerm ?? '').trim();
     const limit = Math.min(Math.max(1, qInt(req, 'Limit', 20)), 50);
     const includeItemTypes = req.query.IncludeItemTypes ?? req.query.includeItemTypes;
 
-    if (!term) {
-      res.json({ SearchHints: [], TotalRecordCount: 0 });
-      return;
-    }
-
-    const config = await loadConfig(req);
+    const config = term ? await loadConfig(req) : null;
     if (!config) {
       res.json({ SearchHints: [], TotalRecordCount: 0 });
       return;
     }
 
-    const userUUID = req.params.userUUID;
-    const serverId = serverIdFor(userUUID);
-    const items = await searchAcross(userUUID, config, serverId, term, limit, includeItemTypes);
-
-    const filtered = items.slice(0, limit);
-
-    res.json({
-      SearchHints: filtered.map((item: any) => ({
-        ItemId: item.Id,
-        Id: item.Id,
-        Name: item.Name,
-        Type: item.Type,
-        MediaType: item.MediaType ?? 'Video',
-        ProductionYear: item.ProductionYear,
-        PrimaryImageTag: item.ImageTags?.Primary,
-        BackdropImageTag: item.BackdropImageTags?.[0],
-        BackdropImageItemId: item.Id,
-        PrimaryImageAspectRatio: item.PrimaryImageAspectRatio,
-        RunTimeTicks: item.RunTimeTicks,
-      })),
-      TotalRecordCount: filtered.length,
+    const items = await suggestHints(config, serverIdFor(req.params.userUUID), term, limit, includeItemTypes).catch((error: any) => {
+      logger.debug(`Search suggestions unavailable: ${error.message}`);
+      return [];
     });
+    res.json({ SearchHints: items.map(toHint), TotalRecordCount: items.length });
   });
 
   router.get('/Genres', async (req: any, res: any) => {
@@ -1893,6 +2336,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   const imagesFor = async (req: any, itemId: string): Promise<any | undefined> => {
     const userUUID = req.params.userUUID;
     const scope = serverIdFor(userUUID);
+    await loadConfig(req).catch(() => null);
 
     const known = await recallImages(scope, itemId);
     if (known) return known;
@@ -1915,9 +2359,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     if (descriptor.k === 'episode') {
       const meta = await fetchMeta(userUUID, 'series', descriptor.i);
       if (!meta) return undefined;
-      const video = findEpisodeVideo(meta, descriptor);
-      if (video) buildEpisode(meta, video, descriptor.t, encodeSeriesId(descriptor), scope);
-      return (await recallImages(scope, itemId)) ?? { primary: meta.poster || undefined };
+      const video = await videoForEpisode(meta, descriptor);
+      const built = video ? buildEpisode(meta, video, descriptor.t, encodeSeriesId(descriptor), scope) : null;
+      return (await recallImages(scope, itemId))
+        ?? (built?.Id && built.Id !== itemId ? await recallImages(scope, String(built.Id)) : undefined)
+        ?? { primary: meta.poster || undefined };
     }
 
     if (descriptor.k === 'collection' || descriptor.k === 'boxset') {
@@ -1956,7 +2402,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const chain: any[] = [];
 
     if (descriptor.k === 'episode') {
-      const video = findEpisodeVideo(meta, descriptor);
+      const video = await videoForEpisode(meta, descriptor);
       const number = (Number.isInteger(video?.season) ? video.season : null) ?? descriptor.s;
       const season = number === null || number === undefined
         ? null
@@ -1982,7 +2428,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       : undefined;
     const named = tag ? artTag(tag) : '';
     if (named && (!url || imageTag(url) !== named)) {
-      url = (await recallArt(serverIdFor(req.params.userUUID), named)) ?? url;
+      url = (await recallArt(named)) ?? url;
     }
 
     if (!url) {
@@ -1990,16 +2436,26 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return;
     }
     const maxWidth = qInt(req, 'MaxWidth', 0) || qInt(req, 'FillWidth', 0) || qInt(req, 'Width', 0);
-    url = sourceSized(url, kind, maxWidth);
+    url = sourceSized(url, kind, maxWidth, clientListed(req, 'JELLYFIN_RASTER_LOGO_CLIENTS'));
     const descriptor = await decodeJellyfinId(String(req.params.itemId));
     const collectionArt = descriptor?.k === 'collection' || descriptor?.k === 'boxset';
 
+    const relaying = relaysImages(req);
     const cached = throughPosterCache(url, collectionArt ? 'collection' : descriptor?.k === 'episode' && kind === 'primary' ? 'thumb' : kind);
     if (cached) {
       const local = builtinPosterCachePath(cached);
       if (local) {
         const step = hasRenditions(url) ? null : widthStep(maxWidth);
+        const unstored = step ? unstoredSource(local) : null;
+        if (unstored) {
+          await sizedArtwork(req, res, unstored, step!, relaying);
+          return;
+        }
         await serveFromPosterCache(req, res, local, cached, step);
+        return;
+      }
+      if (relaying) {
+        await relayImage(req, res, cached);
         return;
       }
       res.set('Cache-Control', 'public, max-age=86400');
@@ -2009,20 +2465,16 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     // An episode still is 16:9; shaping it to 2:3 blurs and enlarges it for
     // nothing. Only the sources that publish landscape posters are reshaped.
     const poster = kind === 'primary' && !collectionArt && descriptor?.k !== 'episode';
-    const reshapes = poster && shapesPoster(url);
-
-    if (!reshapes && redirectsImages()) {
-      res.set('Cache-Control', 'public, max-age=86400');
-      res.redirect(302, url);
+    if (poster && shapesPoster(url)) {
+      await shapedPoster(req, res, url, maxWidth, relaying);
       return;
     }
-    // A poster is held in memory either way: a shelf shows the same one on many
-    // items, and reshaping is not what makes fetching it again expensive.
-    if (poster) {
-      await streamPoster(res, url, maxWidth, reshapes);
+    if (relaying) {
+      await relayImage(req, res, url);
       return;
     }
-    await streamImage(res, url);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.redirect(302, url);
   });
 
   const TMDB_ORIGINAL = 'https://image.tmdb.org/t/p/original/';
@@ -2042,15 +2494,26 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     background: { small: 480, medium: 1920, large: 1920 },
   };
 
-  /** Hosts that publish each image at several sizes, so a smaller one is a link rather than a resize. */
+  const FANART = 'https://assets.fanart.tv/fanart/';
+  const FANART_PREVIEW = 'https://assets.fanart.tv/preview/';
+  const FANART_PREVIEW_WIDTH = 200;
+
+  /** Hosts whose smaller copy is picked to fit the width asked for, so a resize would gain nothing. */
   const hasRenditions = (url: string): boolean =>
-    url.startsWith('https://image.tmdb.org/t/p/') || url.startsWith(TVDB) || METAHUB.test(url);
+    url.startsWith('https://image.tmdb.org/t/p/') || METAHUB.test(url) || url.startsWith(FANART_PREVIEW);
+
+  const TMDB_SVG = /(image\.tmdb\.org\/t\/p\/[^/]+\/[^/?#]+)\.svg(?=$|[?#])/i;
 
   /** The source's own smallest rendition at least as wide as asked, never larger than the link names. */
-  const sourceSized = (url: string, kind: string, maxWidth: number): string => {
+  const sourceSized = (url: string, kind: string, maxWidth: number, raster = false): string => {
+    if (raster) url = url.replace(TMDB_SVG, '$1.png');
     if (url.includes(TMDB_ORIGINAL)) {
       const bucket = kind === 'logo' ? 'logo' : kind === 'backdrop' || kind === 'thumb' ? 'backdrop' : 'poster';
       const widths = TMDB_WIDTHS[bucket];
+      if (!(maxWidth > 0)) {
+        const preferred = kind === 'thumb' ? tmdbLandscapeSize() : bucket === 'backdrop' ? tmdbBackdropSize() : bucket === 'logo' ? tmdbLogoSize() : tmdbPosterSize();
+        if (preferred === 'original') return url;
+      }
       const wanted = maxWidth > 0 ? maxWidth : bucket === 'backdrop' ? 1280 : bucket === 'logo' ? 500 : 780;
       const width = widths.find((w) => w >= wanted);
       return width ? url.replace(TMDB_ORIGINAL, `https://image.tmdb.org/t/p/w${width}/`) : url;
@@ -2060,6 +2523,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const thumb = TVDB_THUMBS.find(([path]) => path.test(url));
       return thumb && maxWidth <= thumb[1] ? url.replace(/(\.\w+)$/, '_t$1') : url;
     }
+    if (url.startsWith(FANART) && kind !== 'logo' && maxWidth <= FANART_PREVIEW_WIDTH) return url.replace(FANART, FANART_PREVIEW);
     const metahub = METAHUB.exec(url);
     if (metahub) {
       const [prefix, kindName, size] = metahub;
@@ -2102,36 +2566,147 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       });
     });
 
-  type ShapedOutput = { body: Buffer; contentType: string };
-
-  const redirectsImages = (): boolean =>
-    /^(1|true|yes|on)$/i.test(String(require('../settingsService').getSetting('JELLYFIN_IMAGE_REDIRECT') || ''));
-
-  /** Sending more than the client asked for is bytes and a decode it throws away. */
-  const narrowed = async (image: ShapedOutput, maxWidth: number): Promise<ShapedOutput> => {
-    const step = widthStep(maxWidth);
-    return step ? resizeToWidth(image.body, image.contentType, step) : image;
+  const clientListed = (req: any, key: string): boolean => {
+    const names = String(require('../settingsService').getSetting(key) || '')
+      .split(',')
+      .map((name) => name.trim().toLowerCase())
+      .filter(Boolean);
+    if (!names.length) return false;
+    const seen = `${clientInfo(req).client} ${req.get('user-agent') || ''}`.toLowerCase();
+    return names.some((name) => seen.includes(name));
   };
 
-  // Without a cache the bytes pass through here anyway, so a poster is shaped on the way out.
-  const streamPoster = async (res: any, url: string, maxWidth: number, reshape: boolean): Promise<void> => {
+  const relaysImages = (req: any): boolean => {
+    const { getSetting } = require('../settingsService');
+    const mode = String(getSetting('JELLYFIN_IMAGE_DELIVERY') || 'auto').trim().toLowerCase();
+    if (mode === 'relay') return true;
+    if (mode === 'redirect') return false;
+    return clientListed(req, 'JELLYFIN_IMAGE_RELAY_CLIENTS');
+  };
+
+  const imageSetting = (key: string, fallback: number, min: number): number => {
+    const value = Number(require('../settingsService').getSetting(key));
+    return Number.isFinite(value) && value >= min ? Math.floor(value) : fallback;
+  };
+
+  let liveRelays = 0;
+
+  const relayImage = async (req: any, res: any, url: string): Promise<void> => {
+    if (liveRelays >= imageSetting('JELLYFIN_IMAGE_RELAY_CONCURRENCY', 32, 1)) {
+      res.redirect(302, url);
+      return;
+    }
+    liveRelays++;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), imageSetting('JELLYFIN_IMAGE_RELAY_TIMEOUT_MS', 15000, 1000));
+    const abandon = () => controller.abort();
+    res.once('close', abandon);
     try {
-      const image = await cachedArtwork(`${url}|${widthStep(maxWidth) ?? 0}|${reshape ? 'shaped' : 'source'}`, async () => {
-        const { openImageStream } = require('../posterCache/upstream');
-        const { shapePoster } = require('../posterCache/shape');
-        const upstream = await openImageStream(url);
-        if (upstream.notModified) throw new Error('not modified');
-        const chunks: Buffer[] = [];
-        for await (const chunk of upstream.response.data) chunks.push(Buffer.from(chunk));
-        const source: ShapedOutput = { body: Buffer.concat(chunks), contentType: upstream.contentType };
-        return narrowed(reshape ? await shapePoster(source.body, source.contentType) : source, maxWidth);
-      });
-      res.set('Content-Type', image.contentType);
+      const { openImageStream } = require('../posterCache/upstream');
+      const { getMaxObjectBytes } = require('../posterCache/config');
+      const etag = req.get('if-none-match');
+      const upstream = await openImageStream(url, { signal: controller.signal, ...(etag ? { validators: { etag } } : {}) });
+      if (upstream.notModified) {
+        res.status(304).end();
+        return;
+      }
+      const stream = upstream.response.data;
+      const headers = upstream.response.headers;
+      if (Number(headers['content-length'] || 0) > getMaxObjectBytes()) {
+        stream.destroy();
+        res.redirect(302, url);
+        return;
+      }
+      res.set('Content-Type', upstream.contentType);
+      if (headers['etag']) res.set('ETag', headers['etag']);
+      if (headers['last-modified']) res.set('Last-Modified', headers['last-modified']);
+      res.set('Content-Security-Policy', IMAGE_CSP);
       res.set('Cache-Control', 'public, max-age=86400');
-      res.end(image.body);
+      if (req.method === 'HEAD') {
+        stream.destroy();
+        res.end();
+        return;
+      }
+      await pipeline(stream, res).catch(() => undefined);
     } catch (error: any) {
+      logger.debug(`Image relay failed for ${url}: ${error?.message || error}`);
+      if (!res.headersSent) res.redirect(302, url);
+    } finally {
+      clearTimeout(timer);
+      res.off('close', abandon);
+      liveRelays--;
+    }
+  };
+
+  const sourceImage = async (url: string): Promise<{ body: Buffer; contentType: string }> => {
+    const { openImageStream } = require('../posterCache/upstream');
+    const { getMaxObjectBytes } = require('../posterCache/config');
+    const upstream = await openImageStream(url);
+    if (upstream.notModified) throw new Error('not modified');
+    const limit = getMaxObjectBytes();
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of upstream.response.data) {
+      bytes += chunk.length;
+      if (bytes > limit) {
+        upstream.response.data.destroy();
+        throw new Error(`larger than ${limit} bytes`);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return { body: Buffer.concat(chunks), contentType: upstream.contentType };
+  };
+
+  const sendArtwork = (res: any, image: { body: Buffer; contentType: string }): void => {
+    res.set('Content-Type', image.contentType);
+    res.set('Content-Security-Policy', IMAGE_CSP);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.end(image.body);
+  };
+
+  const shapedPoster = async (req: any, res: any, url: string, maxWidth: number, relaying: boolean): Promise<void> => {
+    try {
+      const image = await cachedArtwork(`${url}|${widthStep(maxWidth) ?? 0}|shaped`, async () => {
+        if (imageQueueFull()) throw new ImageQueueFull();
+        const { shapePoster } = require('../posterCache/shape');
+        const source = await sourceImage(url);
+        return inImageSlot(async () => {
+          const shaped = await shapePoster(source.body, source.contentType);
+          const step = widthStep(maxWidth);
+          return step ? shrinkToWidth(shaped.body, shaped.contentType, step) : shaped;
+        }, source.body.length);
+      });
+      sendArtwork(res, image);
+    } catch (error: any) {
+      if (error instanceof ImageQueueFull) {
+        if (relaying) await relayImage(req, res, url);
+        else res.redirect(302, url);
+        return;
+      }
       logger.debug(`Image stream failed for ${url}: ${error?.message || error}`);
       res.status(404).end();
+    }
+  };
+
+  const unstoredSource = (path: string): string | null => {
+    const posterCache = require('../posterCache/config');
+    const match = /^\/([a-z]+)\/(https?:\/\/.+)$/i.exec(path.slice(posterCache.POSTER_CACHE_ROUTE.length));
+    if (!match || !posterCache.isValidImageClass(match[1]) || posterCache.isClassEnabled(match[1])) return null;
+    return match[2];
+  };
+
+  const sizedArtwork = async (req: any, res: any, url: string, step: number, relaying: boolean): Promise<void> => {
+    try {
+      const image = await cachedArtwork(`${url}|${step}|sized`, async () => {
+        if (imageQueueFull()) throw new ImageQueueFull();
+        const source = await sourceImage(url);
+        return inImageSlot(() => shrinkToWidth(source.body, source.contentType, step), source.body.length);
+      });
+      sendArtwork(res, image);
+    } catch (error: any) {
+      if (!(error instanceof ImageQueueFull)) logger.debug(`Image resize failed for ${url}: ${error?.message || error}`);
+      if (relaying) await relayImage(req, res, url);
+      else res.redirect(302, url);
     }
   };
 
@@ -2146,24 +2721,6 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     if (!prefix) return null;
     const imageClass = kind === 'collection' ? 'collection' : kind === 'backdrop' ? 'background' : kind === 'logo' ? 'logo' : kind === 'thumb' ? 'landscape' : 'poster';
     return posterCache.buildCachedUrl(prefix, imageClass, url);
-  };
-
-  const streamImage = async (res: any, url: string): Promise<void> => {
-    try {
-      const { openImageStream } = require('../posterCache/upstream');
-      const upstream = await openImageStream(url);
-      if (upstream.notModified) {
-        res.status(404).end();
-        return;
-      }
-      res.set('Content-Type', upstream.contentType);
-      res.set('Cache-Control', 'public, max-age=86400');
-      upstream.response.data.on('error', () => res.end());
-      upstream.response.data.pipe(res);
-    } catch (error: any) {
-      logger.debug(`Image stream failed for ${url}: ${error?.message || error}`);
-      res.status(404).end();
-    }
   };
 
   // A bare array, not a list. Some clients build their whole view from this and
@@ -2206,7 +2763,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const serverId = serverIdFor(userUUID);
     const played = await playedPick(req, userUUID, config, catalog.type, serverId, String(parentId));
     const window = await fetchWindow(userUUID, catalog, 0, limit, {}, undefined, profileTags(config), played.key, played.pick);
-    const items = window.items
+    const items = servedOrder(window.items, window)
       .filter((meta: any) => meta && meta.id)
       .map((meta: any) => metaToBaseItem(meta, catalog.type, serverId, String(parentId)));
     if (isLandscapeCatalog(config, catalog)) showLandscape(items);
@@ -2283,14 +2840,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       if (!parsed) continue;
 
       // An episode the index lacks may have aired since it was read.
-      let episodes = buildEpisodes(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, null);
-      let target = await locateEpisode(episodes, row.videoId, row.mediaType, String(meta.id));
+      let target = await locateOneEpisode(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, row.videoId);
       if (!target) {
         const fresh = await refreshSeriesIndex(userUUID, row.metaId);
         if (fresh) {
           meta = fresh;
-          episodes = buildEpisodes(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, null);
-          target = await locateEpisode(episodes, row.videoId, row.mediaType, String(meta.id));
+          target = await locateOneEpisode(meta, row.mediaType, encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) }), serverId, row.videoId);
         }
       }
       if (!target) {
@@ -2326,7 +2881,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     }
     const seasons = await withSeasonAnimeIds(found.meta, buildSeasons(found.meta, found.descriptor.t, String(req.params.seriesId), serverIdFor(req.params.userUUID)));
     const seasonsConfig = await loadConfig(req);
-    if (seasonsConfig) await applyRatings(seasons, req.params.userUUID, profileKey(seasonsConfig));
+    if (seasonsConfig) {
+      await applyWatchedState(seasons, await watchedSnapshot(req.params.userUUID, seasonsConfig), req.params.userUUID, profileKey(seasonsConfig), seasonsConfig, {
+        seriesVideos: seriesVideosOf(found.meta),
+      });
+    }
     res.json(itemList(seasons, seasons.length, 0));
   });
 
@@ -2410,7 +2969,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     warmSeriesMetas(req, userUUID, page);
   });
 
-  const buildNextUp = async (req: any, userUUID: string, config: any, notePending: (at: number) => void = () => {}): Promise<any[]> => {
+  nextUpTracer = (userUUID, config, trace) => buildNextUp({ query: {} }, userUUID, config, undefined, trace);
+
+  const buildNextUp = async (req: any, userUUID: string, config: any, notePending: (at: number) => void = () => {}, trace?: NextUpTrace): Promise<any[]> => {
     const t0 = Date.now();
     const lap = { snapshot: 0, resumable: 0, own: 0, meta: 0, episodes: 0, state: 0 };
     const snapshot = await watchedSnapshot(userUUID, config);
@@ -2444,18 +3005,32 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     lap.resumable = Date.now() - t1;
     // The table first; a tracker adds the shows it knows that the table does not.
     const t2 = Date.now();
-    const own = (await ownNextUpRows(userUUID, profileKey(config))).filter((row) => !snapshot.dropped.has(row.metaId));
+    const ownRows = await ownNextUpRows(userUUID, profileKey(config));
+    const own = ownRows.filter((row) => !snapshot.dropped.has(row.metaId));
     lap.own = Date.now() - t2;
+    if (trace) {
+      for (const row of ownRows) if (snapshot.dropped.has(row.metaId)) trace(row, 'server', { outcome: 'dropped' });
+      for (const row of snapshot.nextUp) if (snapshot.dropped.has(row.metaId)) trace(row, 'tracker', { outcome: 'dropped' });
+    }
+    const { homedRows } = require('./episodeHome');
+    const home = <T extends { metaId: string; videoId?: string | null; mediaType: string }>(rows: T[]): Promise<T[]> => homedRows(userUUID, config, rows);
+    const trackerRows = await home(snapshot.nextUp.filter((row) => !snapshot.dropped.has(row.metaId)));
+    const sourceOf = (row: any): NextUpSource => (own.includes(row) ? 'server' : trackerRows.includes(row) ? 'tracker' : 'sequel');
     // One row per resolved show; the table's newest spelling first.
     const animeOnly = keepsAnimeOnly(config) && !(req.query.SeriesId ?? req.query.seriesId ?? req.query.ParentId ?? req.query.parentId);
-    const offered = [...[...own].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt), ...snapshot.nextUp.filter((row) => !snapshot.dropped.has(row.metaId))]
-      .filter((row) => !animeOnly || isAnimeTitle(row.metaId, 'series'));
+    const sequels = await home((await animeSequels(snapshot)).nextUp);
+    const offered = [...[...own].sort((a, b) => b.lastWatchedAt - a.lastWatchedAt), ...trackerRows, ...sequels]
+      .filter((row) => {
+        if (!animeOnly || isAnimeTitle(row.metaId, 'series')) return true;
+        trace?.(row, sourceOf(row), { outcome: 'not-anime' });
+        return false;
+      });
     const identities = new Map<string, string>();
     await mapWithConcurrency([...new Set(offered.map((row) => row.metaId))], shelfConcurrency(), async (metaId) => {
       identities.set(metaId, await showIdentity(metaId, config));
     });
     const trackerTimes = new Map<string, Omit<NextUpRow, 'lastWatchedAt'>>();
-    for (const row of [...snapshot.nextUp, ...(await followedTimes)]) {
+    for (const row of [...trackerRows, ...(await home(await followedTimes))]) {
       if ((row.airsAt || row.aired) && !trackerTimes.has(row.metaId)) trackerTimes.set(row.metaId, row);
     }
     const taken = new Set<string>();
@@ -2467,6 +3042,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         return true;
       })
       .sort((a, b) => b.lastWatchedAt - a.lastWatchedAt);
+    const sources = new Map(offered.map((row) => [row, sourceOf(row)]));
+    const trackerRanks = new Map<string, number>();
+    for (const row of trackerRows) {
+      const identity = identities.get(row.metaId) ?? row.metaId;
+      if (Number.isFinite(row.trackerRank) && !trackerRanks.has(identity)) trackerRanks.set(identity, row.trackerRank!);
+    }
 
     // A series page asks for its own next episode; an unplayed show starts at the first.
     const seriesParam = req.query.SeriesId ?? req.query.seriesId ?? req.query.ParentId ?? req.query.parentId;
@@ -2492,7 +3073,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         const counts = counted.get(row.metaId);
         const timed = trackerTimes.get(row.metaId);
         const airedSinceCounted = Boolean(timed?.aired) || (timed?.airsAt ?? Infinity) <= listedAt;
-        if (counts && counts.total > 0 && counts.watched >= counts.total && !airedSinceCounted) return false;
+        if (counts && counts.total > 0 && counts.watched >= counts.total && !airedSinceCounted) {
+          trace?.(row, sources.get(row) ?? 'server', { outcome: 'finished', watched: counts.watched, total: counts.total });
+          return false;
+        }
       }
       return true;
     });
@@ -2505,6 +3089,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     // Every candidate is tried once; a page needs no second scan.
     const items: any[] = [];
     const identity: string[] = [];
+    const availableAt: number[] = [];
     let skipped = 0;
     await warmSeriesIndex(userUUID, rows.map((row) => row.metaId));
     await mapWithConcurrency(rows, shelfConcurrency(), async (row, index) => {
@@ -2524,6 +3109,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       if (!meta) {
         skipped += 1;
         logger.debug(`Next Up skipped ${row.metaId}: no meta`);
+        trace?.(row, sources.get(row) ?? 'server', { outcome: 'no-meta' });
         return;
       }
       let seriesId = encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) });
@@ -2540,6 +3126,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
           target = await locate(episodes, String(meta.id));
         }
       }
+      if (!target && !episodes.length && row.episode === 1 && row.airsAt && row.airsAt <= Date.now()) {
+        target = episodeFromDate(meta, row, new Date(row.airsAt).toISOString(), seriesId, serverId);
+        episodes = [target];
+      }
 
       // The table and a tracker can name one show in different id spaces.
       identity[index] = meta._tmdbId ? `tmdb:${meta._tmdbId}` : meta._imdbId ? `imdb:${meta._imdbId}` : String(meta.id);
@@ -2547,6 +3137,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       if (!target) {
         skipped += 1;
         logger.debug(`Next Up skipped ${row.metaId}: ${row.videoId ?? `S${row.season ?? '?'}E${row.episode}`} is not among its ${episodes.length} episodes`);
+        trace?.(row, sources.get(row) ?? 'server', { outcome: 'missing-episode', episodes: episodes.length, meta });
         return;
       }
 
@@ -2576,34 +3167,58 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         : borrowedFits
           ? borrowed!.airsAt ?? Math.min(Date.parse(next.PremiereDate || '') || nowMs, nowMs)
           : Date.parse(next?.PremiereDate || '');
+      const traced = async (step: Omit<NextUpStep, 'meta' | 'watched' | 'total'>) => {
+        if (!trace) return;
+        const regular = episodes.filter((episode: any) => episode.ParentIndexNumber !== 0);
+        await applyWatchedState(regular, snapshot, userUUID, profileKey(config));
+        const aired = regular.filter((episode: any) => !(Date.parse(episode.PremiereDate || '') > nowMs));
+        trace(row, sources.get(row) ?? 'server', { ...step, meta, watched: aired.filter((episode: any) => episode.UserData?.Played === true).length, total: aired.length });
+      };
       if (!next) {
         skipped += 1;
         logger.debug(`Next Up skipped ${row.metaId}: every episode from ${target.Name} on is played`);
+        await traced({ outcome: 'caught-up', from: episodeLabel(target) });
         return;
       }
       if (Number.isFinite(airedAt) && airedAt > nowMs) {
         notePending(airedAt);
         skipped += 1;
         logger.debug(`Next Up skipped ${row.metaId}: ${next.Name} airs ${next.PremiereDate}`);
+        await traced({ outcome: 'airs-later', next: episodeLabel(next), airsAt: airedAt });
         return;
       }
       if (!Number.isFinite(airedAt) && episodes.some((episode: any) => Number.isFinite(Date.parse(episode?.PremiereDate || '')))) {
         skipped += 1;
         logger.debug(`Next Up skipped ${row.metaId}: ${next.Name} has no air date`);
+        await traced({ outcome: 'no-air-date', next: episodeLabel(next) });
         return;
       }
       if (Number.isFinite(airedAt) && airedAt !== Date.parse(next.PremiereDate || '')) next.PremiereDate = new Date(airedAt).toISOString();
+      const startedAt = Date.parse(next.UserData?.LastPlayedDate || '');
       items[index] = next;
+      availableAt[index] = Math.max(row.lastWatchedAt || 0, Number.isFinite(airedAt) ? airedAt : 0, Number.isFinite(startedAt) ? startedAt : 0);
+      if (availableAt[index] > 0) next.UserData = { ...next.UserData, LastPlayedDate: new Date(availableAt[index]).toISOString() };
+      await traced({ outcome: 'shown', next: episodeLabel(next) });
     });
 
     const shown = new Set<string>();
+    const capped = keepsUnderProfileCap(config);
+    const rankOf = (row: any) => trackerRanks.get(identities.get(row.metaId) ?? row.metaId) ?? Number.MAX_SAFE_INTEGER;
     const found = items
-      .filter((item, index) => {
-        if (!item || shown.has(identity[index])) return false;
+      .map((item, index) => ({ item, row: rows[index], index }))
+      .filter(({ item, row, index }) => {
+        if (!item) return false;
+        if (shown.has(identity[index])) {
+          trace?.(row, sources.get(row) ?? 'server', { outcome: 'duplicate' });
+          return false;
+        }
         shown.add(identity[index]);
-        return true;
+        if (capped(item)) return true;
+        trace?.(row, sources.get(row) ?? 'server', { outcome: 'rating-cap' });
+        return false;
       })
-      .filter(keepsUnderProfileCap(config));
+      .sort((a, b) => availableAt[b.index] - availableAt[a.index] || rankOf(a.row) - rankOf(b.row))
+      .map(({ item }) => item);
     logger.info(`Next Up built for ${userUUID}: ${found.length} of ${rows.length} candidates (${own.length} own, ${snapshot.nextUp.length} tracker), ${skipped} skipped, in ${Date.now() - t0}ms (snapshot ${lap.snapshot}, resumable ${lap.resumable}, own rows ${lap.own}, meta ${lap.meta}, episodes ${lap.episodes}, state ${lap.state}, summed over ${shelfConcurrency()} lanes)`);
     return found;
   };
@@ -2621,7 +3236,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     }
 
     const digest = (await watchedSnapshot(userUUID, config)).fingerprint;
-    const memoKey = `${userUUID}:${profileKey(config)}:upcoming:${digest}`;
+    const memoKey = `${userUUID}:${profileKey(config)}:upcoming:${upcomingMode(config)}:${digest}`;
     const holdMs = upcomingHoldMs();
     const ordered = await memoNextUp(userUUID, memoKey, () => buildUpcoming(userUUID, config), (items) =>
       items
@@ -2633,28 +3248,113 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     res.json(itemList(ordered.slice(startIndex, startIndex + limit), ordered.length, startIndex));
   });
 
-  // Tracker-followed shows are all checked; locally known ones are capped.
+  // Tracker-followed shows are all checked; watchlisted and locally known ones are capped.
   const showsInView = async (userUUID: string, config: any, days: number) => {
-    const [snapshot, resume, own, caughtUp] = await Promise.all([
+    const watchlistLimit = envInt('JELLYFIN_UPCOMING_WATCHLIST_LIMIT', 100, 1);
+    const [snapshot, resume, own, followedFeed, listed] = await Promise.all([
       watchedSnapshot(userUUID, config),
       resumeSnapshot(userUUID, config),
       ownNextUpRows(userUUID, profileKey(config)),
       upcomingFollowed(config, days),
+      watchlistEntries(userUUID, config, watchlistLimit).catch(() => ({ entries: [] as any[] })),
+    ]);
+    const { homedRows } = require('./episodeHome');
+    const [trackerRows, caughtUp, following] = await Promise.all([
+      homedRows(userUUID, config, snapshot.nextUp) as Promise<NextUpRow[]>,
+      homedRows(userUUID, config, followedFeed) as Promise<UpcomingRow[]>,
+      homedRows(userUUID, config, snapshot.following) as Promise<typeof snapshot.following>,
     ]);
     const shows = new Map<string, string>();
-    for (const row of [...caughtUp, ...snapshot.following]) {
+    for (const row of [...caughtUp, ...following]) {
       if (!shows.has(row.metaId)) shows.set(row.metaId, row.mediaType);
+    }
+    const watchlisted = listed.entries
+      .filter((entry: any) => entryItemType(entry) === 'Series' && !snapshot.dropped.has(entry.metaId))
+      .slice(0, watchlistLimit);
+    for (const entry of watchlisted) {
+      if (!shows.has(entry.metaId)) shows.set(entry.metaId, entry.mediaType);
     }
     let local = 0;
     const localCap = envInt('JELLYFIN_UPCOMING_LOCAL_SHOWS', 60, 0);
-    for (const row of [...own, ...snapshot.nextUp, ...resume.filter((r) => r.kind === 'episode')].filter((r) => !snapshot.dropped.has(r.metaId))) {
+    for (const row of [...own, ...trackerRows, ...resume.filter((r) => r.kind === 'episode')].filter((r) => !snapshot.dropped.has(r.metaId))) {
       if (shows.has(row.metaId)) continue;
       if (local >= localCap) break;
       shows.set(row.metaId, row.mediaType);
       local += 1;
     }
     const followed = [...shows.entries()].filter(([metaId]) => !keepsAnimeOnly(config) || isAnimeTitle(metaId, 'series'));
-    return { snapshot, caughtUp, followed };
+    const sequels = (await homedRows(userUUID, config, (await animeSequels(snapshot)).upcoming) as UpcomingRow[]).filter((row) => !shows.has(row.metaId));
+    return { snapshot, caughtUp, followed, sequels, trackerRows };
+  };
+
+  const onePerEpisode = async (episodes: any[], config: any): Promise<any[]> => {
+    const { videoIdAliases } = require('./aliases');
+    const { stremioIdFor } = require('./idsCodec');
+    const { perEntryAnime } = require('./watchlistSources');
+    const keepsAnime = perEntryAnime(config);
+    const spelled = await Promise.all(episodes.map(async (episode) => {
+      const descriptor = await decodeJellyfinId(String(episode.Id));
+      const videoId = descriptor ? stremioIdFor(descriptor) : null;
+      return { episode, anime: descriptor?.k === 'episode' && descriptor.t === 'anime', spellings: videoId ? [videoId, ...(await videoIdAliases(videoId))] : [String(episode.Id)] };
+    }));
+    const kept: typeof spelled = [];
+    for (const entry of spelled) {
+      const held = kept.findIndex((other) => other.spellings.some((spelling) => entry.spellings.includes(spelling)));
+      if (held === -1) kept.push(entry);
+      else if (kept[held].anime !== entry.anime && entry.anime === keepsAnime) kept[held] = entry;
+    }
+    return kept.map((entry) => entry.episode);
+  };
+
+  const sequelPremieres = async (userUUID: string, rows: UpcomingRow[], keep: (at: number) => boolean, seen: Set<string>): Promise<any[]> => {
+    const serverId = serverIdFor(userUUID);
+    const out: any[] = [];
+    await mapWithConcurrency(rows.filter((row) => row.airsAt && keep(row.airsAt)), shelfConcurrency(), async (row) => {
+      const meta = await seriesIndex(userUUID, row.metaId);
+      if (!meta) return;
+      const identity = meta._tmdbId ? `tmdb:${meta._tmdbId}` : meta._imdbId ? `imdb:${meta._imdbId}` : String(meta.id);
+      if (seen.has(identity)) return;
+      seen.add(identity);
+      const premiere = new Date(row.airsAt as number).toISOString();
+      const seriesId = encodeJellyfinId({ k: 'series', t: row.mediaType, i: String(meta.id) });
+      const episode = (row.videoId
+        ? await locateOneEpisode(meta, row.mediaType, seriesId, serverId, row.videoId)
+        : buildEpisodes(meta, row.mediaType, seriesId, serverId, null).find((e: any) => e.IndexNumber === row.episode))
+        ?? episodeFromDate(meta, row, premiere, seriesId, serverId);
+      episode.PremiereDate = premiere;
+      out.push(episode);
+    });
+    return out;
+  };
+
+  const serverWatchlistItems = async (userUUID: string, config: any, serverId: string, wanted: Set<string> | null): Promise<any[] | null> => {
+    if (require('./watchlistSources').watchlistPicks(config).size) return null;
+    const { isServerWatchlistCatalog, serverWatchlistMediaType } = require('../serverWatchlist');
+    const shelves = (await getCatalogs(userUUID, config)).filter((catalog: any) => {
+      const mediaType = isServerWatchlistCatalog(catalog.id) ? serverWatchlistMediaType(catalog.id) : undefined;
+      if (!mediaType || !wanted) return Boolean(mediaType);
+      return mediaType === 'all' || mediaType === 'anime' ? wanted.has('Movie') || wanted.has('Series') : wanted.has(mediaType === 'movie' ? 'Movie' : 'Series');
+    });
+    if (!shelves.length) return null;
+    const cap = envInt('SERVER_WATCHLIST_MAX_ITEMS', 500, 1);
+    const { viewerProfile } = require('./viewer');
+    const listed: any[] = await database.listWatchlist(userUUID, viewerProfile()).catch(() => []);
+    const addedAt = new Map(listed.filter((row) => Number(row.listed)).map((row) => [String(row.meta_id), Number(row.updated_at) || 0]));
+    const items: any[] = [];
+    const seen = new Set<string>();
+    for (const catalog of shelves) {
+      const window = await fetchWindow(userUUID, catalog, 0, cap, {}, undefined, profileTags(config)).catch(() => ({ items: [] as any[] }));
+      for (const meta of window.items) {
+        const item = metaToBaseItem(meta, serverWatchlistMediaType(catalog.id), serverId, null);
+        if (seen.has(String(meta.id)) || (wanted && !wanted.has(item.Type))) continue;
+        seen.add(String(meta.id));
+        item.UserData = { ...item.UserData, IsFavorite: true, ...(clientHasOwnWatchlist() ? { Likes: true } : {}) };
+        const at = addedAt.get(String(meta.id));
+        if (at) item.DateCreated = new Date(at).toISOString();
+        items.push(item);
+      }
+    }
+    return items.filter(keepsUnderProfileCap(config));
   };
 
   /** Watchlisted films, from every watchlist, whose release date passes `keep`. */
@@ -2681,7 +3381,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       }
     });
     const listed = (await watchlistEntries(userUUID, config, filmLimit).catch(() => ({ entries: [] as any[] }))).entries
-      .filter((entry: any) => entry.mediaType === 'movie')
+      .filter((entry: any) => entryItemType(entry) === 'Movie')
       .slice(0, filmLimit);
     await mapWithConcurrency(listed, shelfConcurrency(), async (entry: any) => {
       const meta = await fetchMeta(userUUID, 'movie', entry.metaId).catch(() => null);
@@ -2690,13 +3390,36 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     return films;
   };
 
+  const heldCalendar = async (userUUID: string, config: any, from: number, to: number, withFilms = false): Promise<any[]> => {
+    const digest = (await watchedSnapshot(userUUID, config)).fingerprint;
+    const blockMs = envInt('JELLYFIN_CALENDAR_BLOCK_DAYS', 120, 7) * 24 * 60 * 60 * 1000;
+    const starts: number[] = [];
+    for (let start = Math.floor(from / blockMs) * blockMs; start <= to; start += blockMs) starts.push(start);
+    let whole: Promise<any[]> | null = null;
+    const span = () => (whole ??= buildCalendar(userUUID, config, starts[0], starts[starts.length - 1] + blockMs - 1, withFilms));
+    const blocks = await Promise.all(starts.map((start) => {
+      const memoKey = `${userUUID}:${profileKey(config)}:calendar:${start}:${blockMs}:${digest}${withFilms ? ':films' : ''}`;
+      const inBlock = (item: any) => {
+        const at = Date.parse(item?.PremiereDate || '');
+        return at >= start && at < start + blockMs;
+      };
+      return memoNextUp(userUUID, memoKey, async () => (await span()).filter(inBlock), (built) =>
+        built.length === 0 ? Date.now() + envInt('JELLYFIN_CALENDAR_EMPTY_TTL', 30, 1) * 1000 : null);
+    }));
+    return blocks.flat().filter((item) => {
+      const at = Date.parse(item?.PremiereDate || '');
+      return at >= from && at <= to;
+    });
+  };
+  calendarReader = heldCalendar;
+
   const buildCalendar = async (userUUID: string, config: any, from: number, to: number, withFilms = false): Promise<any[]> => {
     const serverId = serverIdFor(userUUID);
     const profile = profileKey(config);
     const premiereAt = (item: any): number => Date.parse(item?.PremiereDate || '');
-    const { snapshot, caughtUp, followed } = await showsInView(userUUID, config, envInt('JELLYFIN_UPCOMING_DAYS', 90, 1));
+    const { snapshot, caughtUp, followed, sequels, trackerRows } = await showsInView(userUUID, config, envInt('JELLYFIN_UPCOMING_DAYS', 90, 1));
     const timed = new Map<string, Array<{ videoId?: string | null; season: number | null; episode: number; airsAt: number }>>();
-    for (const row of [...snapshot.nextUp, ...caughtUp]) {
+    for (const row of [...trackerRows, ...caughtUp]) {
       if (!row.airsAt) continue;
       const list = timed.get(row.metaId) || [];
       list.push({ videoId: row.videoId, season: row.season ?? null, episode: row.episode, airsAt: row.airsAt });
@@ -2729,6 +3452,11 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         dated.push(episode);
       }
     });
+    for (const episode of await sequelPremieres(userUUID, sequels, (at) => at >= from && at <= to, seenShows)) {
+      if (seenEpisodes.has(episode.Id)) continue;
+      seenEpisodes.add(episode.Id);
+      dated.push(episode);
+    }
     if (withFilms) dated.push(...(await watchlistFilms(userUUID, config, (at) => Number.isFinite(at) && at >= from && at <= to)));
 
     await applyWatchedState(dated, snapshot, userUUID, profile);
@@ -2738,6 +3466,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   };
 
   const upcomingHoldMs = (): number => envInt('JELLYFIN_UPCOMING_HOLD_HOURS', 12, 0) * 60 * 60 * 1000;
+
+  const upcomingMode = (config: any): 'caught-up' | 'airing' => {
+    const mode = String(require('../settingsService').getSetting('JELLYFIN_UPCOMING_MODE') || 'user');
+    if (mode === 'caught-up' || mode === 'airing') return mode;
+    return config?.jellyfinUpcomingMode === 'airing' ? 'airing' : 'caught-up';
+  };
 
   const buildUpcoming = async (userUUID: string, config: any): Promise<any[]> => {
     const now = Date.now();
@@ -2749,8 +3483,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const within = (at: number): boolean => Number.isFinite(at) && at > now && at <= horizon;
     const holdMs = upcomingHoldMs();
     const lately = (at: number): boolean => Number.isFinite(at) && at <= now && at > now - holdMs;
+    const airing = upcomingMode(config) === 'airing';
 
-    const { snapshot, caughtUp, followed } = await showsInView(userUUID, config, days);
+    const { snapshot, caughtUp, followed, sequels, trackerRows } = await showsInView(userUUID, config, days);
 
     let nextUpShows: Promise<Set<string>> | null = null;
     const inNextUp = async (metaId: string): Promise<boolean> => {
@@ -2775,7 +3510,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       return (await nextUpShows).has(await showIdentity(metaId, config));
     };
     const named = new Map<string, NextUpRow>();
-    for (const row of snapshot.nextUp) if (row.airsAt || row.aired) named.set(row.metaId, row);
+    for (const row of trackerRows) if (row.airsAt || row.aired) named.set(row.metaId, row);
     // MDBList names each followed show's next episode and when it airs, in progress or not,
     // so its time is used only once the show passes the caught-up check below.
     const timed = new Map<string, (typeof caughtUp)[number]>();
@@ -2812,8 +3547,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
           premieres.push(episode);
           return;
         }
-        if (!episode || episode.UserData?.Played !== true) return;
+        if (!airing && (!episode || episode.UserData?.Played !== true)) return;
       }
+      const stillDue = async (episode: any): Promise<boolean> => {
+        await applyWatchedState([episode], snapshot, userUUID, profile);
+        return episode.UserData?.Played !== true && !(airing && (await inNextUp(metaId)));
+      };
       // The episode the tracker names, at the time it gives, before the metadata's guess:
       // the metadata often has only a day, or no date yet.
       let next: any;
@@ -2824,10 +3563,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
           : episodes.find((e: any) => e.IndexNumber === timedRow.episode && (timedRow.season === null || e.ParentIndexNumber === timedRow.season));
         if (named) named.PremiereDate = new Date(timedRow.airsAt as number).toISOString();
         if (named && within(timedRow.airsAt as number)) next = named;
-        else if (named && lately(timedRow.airsAt as number)) {
-          await applyWatchedState([named], snapshot, userUUID, profile);
-          if (named.UserData?.Played !== true) next = named;
-        }
+        else if (named && lately(timedRow.airsAt as number) && (await stillDue(named))) next = named;
       }
       if (!next) {
         const candidates = episodes
@@ -2838,8 +3574,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
             next = candidate;
             break;
           }
-          await applyWatchedState([candidate], snapshot, userUUID, profile);
-          if (candidate.UserData?.Played !== true) {
+          if (await stillDue(candidate)) {
             next = candidate;
             break;
           }
@@ -2851,7 +3586,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       // Only a show the user is caught up on: an aired episode still unwatched
       // is Next Up's business. The snapshot answers for most; the table is
       // asked only about aired episodes it does not hold.
-      const aired = episodes.filter((episode: any) => {
+      const aired = airing ? [] : episodes.filter((episode: any) => {
         const at = premiereAt(episode);
         return Number.isFinite(at) && at <= now && (!nextAired || (episode !== next && at < nextAt));
       });
@@ -2884,9 +3619,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       premieres.push(next);
     });
 
+    premieres.push(...(await sequelPremieres(userUUID, sequels, within, seen)));
     const films = await watchlistFilms(userUUID, config, within, seen);
 
-    return [...premieres, ...films]
+    return [...(await onePerEpisode(premieres, config)), ...films]
       .filter(keepsUnderProfileCap(config))
       .sort((a, b) => premiereAt(a) - premiereAt(b));
   };
@@ -2902,19 +3638,17 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     }
 
     const meta = await fetchMeta(userUUID, descriptor.k, descriptor.i);
-    if (!meta?._tmdbId) {
+    if (!meta) {
       res.json(itemList([], 0, 0));
       return;
     }
 
     const serverId = serverIdFor(userUUID);
-    const rows = await similarTitles(config, String(meta._tmdbId), descriptor.k);
+    const rows = await similarTitles(config, meta, descriptor.k);
     const capped = hasAgeRatingCap(config);
-    const built = await mapWithConcurrency(capped ? rows : rows.slice(0, limit), shelfConcurrency(), async (row: any) => {
-      const full = await previewMeta(config, userUUID, row.type, row.id).catch(() => null);
-      return metaToBaseItem(full ?? row, row.type, serverId, null);
-    });
-    const items = built
+    const picked = capped ? rows : rows.slice(0, limit);
+    const cards = await titleCards(config, userUUID, picked);
+    const items = cards.map((card: any, i: number) => metaToBaseItem(card, picked[i].type, serverId, null))
       .filter(keepsUnderProfileCap(config))
       .slice(0, limit);
     await applyWatchedState(items, await watchedSnapshot(userUUID, config), userUUID, profileKey(config), config);
@@ -2997,6 +3731,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
   });
 
   async function singleItemHandler(req: any, res: any): Promise<void> {
+    if (!req.params.listed) noteWantsPeople(true);
     const userUUID = req.params.userUUID;
     const descriptor = await decodeJellyfinId(req.params.itemId);
     if (!descriptor) {
@@ -3015,7 +3750,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
 
     if (descriptor.k === 'person') {
       const config = await loadConfig(req);
-      const person = config ? await personByName(config, descriptor.n) : null;
+      const person = config ? await resolvePerson(config, descriptor) : null;
       res.json(personItem(String(req.params.itemId), serverIdFor(userUUID), descriptor.n, person));
       return;
     }
@@ -3029,11 +3764,8 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       const { meta, seriesId } = found;
       // Numbering can differ between the series meta and the one an episode's
       // own id resolves to, so the guid is matched rather than the index.
-      const episodes = buildEpisodes(meta, descriptor.t, seriesId, serverIdFor(userUUID), null);
       const wanted = normaliseJellyfinId(String(req.params.itemId));
-      const episode =
-        episodes.find((e: any) => e.Id === wanted) ??
-        episodes.find((e: any) => e.IndexNumber === descriptor.e && e.ParentIndexNumber === descriptor.s);
+      const episode = await episodeItemFor(meta, descriptor, seriesId, serverIdFor(userUUID), wanted);
       if (!episode) {
         res.status(404).json({ Message: 'Item not found' });
         return;
@@ -3072,7 +3804,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
 
       const seasonConfig = await loadConfig(req);
       if (seasonConfig) {
-        await applyWatchedState([season], await watchedSnapshot(userUUID, seasonConfig), userUUID, profileKey(seasonConfig));
+        await applyWatchedState([season], await watchedSnapshot(userUUID, seasonConfig), userUUID, profileKey(seasonConfig), seasonConfig, {
+          seriesVideos: seriesVideosOf(meta),
+        });
       }
 
       res.json(season);
@@ -3145,15 +3879,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
         res.status(404).json({ Message: 'Item not found' });
         return;
       }
-      res.json(
-        collectionFolder(
-          req.params.itemId,
-          serverIdFor(userUUID),
-          catalog.name,
-          viewTypeFor(catalog),
-          null
-        )
-      );
+      res.json(catalogView(catalog, serverIdFor(userUUID), rowFor(config, catalog)));
       return;
     }
 
@@ -3168,7 +3894,10 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     const serverId = serverIdFor(userUUID);
     const config = await database.getUserConfig(userUUID);
     const profile = sessionProfile(req, config);
-    res.json([sessionInfo(profile.userId, serverId, profile.name, clientInfo(req))]);
+    const scoped = await loadConfig(req);
+    const sessions = [sessionInfo(profile.userId, serverId, profile.name, clientInfo(req))];
+    if (scoped) await withNowPlaying(userUUID, scoped, serverId, sessions);
+    res.json(sessions);
   });
 
   router.post(['/Sessions/Capabilities', '/Sessions/Capabilities/Full'], (_req: any, res: any) => {
@@ -3308,21 +4037,40 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
     res.json(playedState(String(req.params.itemId), false));
   });
 
-  router.get(['/UserItems/:itemId/UserData', '/Users/:userId/Items/:itemId/UserData'], async (req: any, res: any) => {
+  const userDataOf = async (req: any, itemId: string): Promise<any | null> => {
     const captured: any[] = [];
     const forged = Object.create(req, {
-      params: { value: { ...req.params, listed: true }, enumerable: true },
+      params: { value: { ...req.params, itemId, listed: true }, enumerable: true },
       query: { value: req.query, enumerable: true },
     });
     await singleItemHandler(
       forged,
       { json: (body: any) => captured.push(body), status: () => ({ json: () => undefined, end: () => undefined }) }
     );
-    if (!captured[0]?.UserData) {
+    return captured[0]?.UserData ?? null;
+  };
+
+  const announceTitle = (req: any, config: any, itemId: string): void => {
+    const userUUID = req.params.userUUID;
+    const profile = profileKey(config);
+    (async () => {
+      const { hasListeners, pushUserData } = require('./socket');
+      if (!(await hasListeners(userUUID, profile))) return;
+      const userData = await userDataOf(req, itemId);
+      if (!userData) return;
+      const { Likes, ...rest } = userData;
+      const id = dashedGuid(normaliseJellyfinId(itemId));
+      pushUserData(userUUID, profile, [{ ...rest, ...(Likes === false || !clientHasOwnWatchlist() ? { Likes } : {}), Key: id, ItemId: id }]);
+    })().catch((error: any) => logger.debug(`User data push failed for ${itemId}: ${error?.message || error}`));
+  };
+
+  router.get(['/UserItems/:itemId/UserData', '/Users/:userId/Items/:itemId/UserData'], async (req: any, res: any) => {
+    const userData = await userDataOf(req, String(req.params.itemId));
+    if (!userData) {
       res.status(404).json({ Message: 'Item not found' });
       return;
     }
-    res.json(captured[0].UserData);
+    res.json(userData);
   });
 
   router.post(['/UserItems/:itemId/UserData', '/Users/:userId/Items/:itemId/UserData'], async (req: any, res: any) => {
@@ -3354,10 +4102,9 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       res.status(404).json({ Message: 'Item not found' });
       return;
     }
-    const changed = clientHasOwnWatchlist()
-      ? await setFavourite(userUUID, config, descriptor, listed)
-      : await setWatchlisted(userUUID, config, descriptor, listed);
+    const changed = await setWatchlisted(userUUID, config, descriptor, listed);
     res.json({ ...EMPTY_USER_DATA, Key: itemId, ItemId: itemId, IsFavorite: changed && listed });
+    if (changed) announceTitle(req, config, itemId);
   };
   const ratingHandler = (clear: boolean) => async (req: any, res: any) => {
     const userUUID = req.params.userUUID;
@@ -3375,6 +4122,12 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       logger.warn(`Rating failed for ${itemId}: ${error?.message || error}`);
       return false;
     });
+    if (clear && (await userDataOf(req, itemId).catch(() => null))?.Rating != null) {
+      const { rateItem } = require('./ratings');
+      await rateItem(userUUID, config, descriptor, null).catch((error: any) =>
+        logger.warn(`Clearing the rating failed for ${itemId}: ${error?.message || error}`)
+      );
+    }
     // A like puts the title on the watchlist and a cleared rating takes it off, for a
     // client that keeps one; a dislike stays a drop, and clearing one only undrops.
     if (clientHasOwnWatchlist() && likes !== false && !(likes === null && undropped)) {
@@ -3383,6 +4136,7 @@ export function createJellyfinRouter(options: { loginRateLimit?: any } = {}): an
       );
     }
     res.json({ ...EMPTY_USER_DATA, Key: itemId, ItemId: itemId, Likes: likes });
+    announceTitle(req, config, itemId);
   };
 
   router.post(['/UserItems/:itemId/Rating', '/Users/:userId/Items/:itemId/Rating'], ratingHandler(false));
@@ -3439,6 +4193,57 @@ export function register(addon: any, options: { loginRateLimit?: any; enabled?: 
     res.json({ approved: true, device: request.deviceName, app: request.appName, profile: profile.name });
   });
 
+  addon.post('/api/jellyfin/:userUUID/played-thresholds', gate, approveRateLimit, async (req: any, res: any) => {
+    const userUUID = String(req.params.userUUID);
+    const password = req.body?.password;
+
+    const accountId = req.session?.accountId;
+    const owns = require('../jellyfinAdmin/adminAuth').isDashboardAdmin(req) || (Boolean(accountId) && (await database.ownsConfig(accountId, userUUID)));
+    const verified = !owns && password ? await database.verifyUserAndGetConfig(userUUID, String(password)) : null;
+    if (!owns && !verified) {
+      res.status(401).json({ error: 'Sign in or enter the configuration password to read the watched points' });
+      return;
+    }
+
+    const config = verified ?? (await database.getUserConfig(userUUID).catch(() => null));
+    const { serverPlayedThreshold, storedPlayedThreshold } = require('./playstate');
+    const profiles = await Promise.all(listProfiles(config, userUUID).map(async (profile) => ({
+      profile: profile.id,
+      percent: await storedPlayedThreshold(userUUID, profile.id),
+    })));
+    res.json({ serverDefault: serverPlayedThreshold(), profiles });
+  });
+
+  addon.post('/api/jellyfin/:userUUID/played-threshold', gate, approveRateLimit, async (req: any, res: any) => {
+    const userUUID = String(req.params.userUUID);
+    const password = req.body?.password;
+
+    const accountId = req.session?.accountId;
+    const owns = require('../jellyfinAdmin/adminAuth').isDashboardAdmin(req) || (Boolean(accountId) && (await database.ownsConfig(accountId, userUUID)));
+    const verified = !owns && password ? await database.verifyUserAndGetConfig(userUUID, String(password)) : null;
+    if (!owns && !verified) {
+      res.status(401).json({ error: 'Sign in or enter the configuration password to change the watched point' });
+      return;
+    }
+
+    const { savePlayedThreshold, validPlayedThreshold } = require('./playstate');
+    const requested = req.body?.percent ?? null;
+    const percent = requested === null ? null : validPlayedThreshold(requested);
+    if (requested !== null && percent === null) {
+      res.status(400).json({ error: 'The watched point is a percentage from 50 to 100' });
+      return;
+    }
+    const config = verified ?? (await database.getUserConfig(userUUID).catch(() => null));
+    const wanted = typeof req.body?.profile === 'string' && req.body.profile ? req.body.profile : null;
+    const profile = profileById(config, userUUID, wanted);
+    if (wanted && profile.id !== wanted) {
+      res.status(404).json({ error: 'Save the configuration first, so this user exists on the server' });
+      return;
+    }
+    await savePlayedThreshold(userUUID, profile.id, percent);
+    res.json({ profile: profile.id, percent });
+  });
+
   addon.post('/api/jellyfin/:userUUID/forget-imported', gate, approveRateLimit, async (req: any, res: any) => {
     const userUUID = String(req.params.userUUID);
     const password = req.body?.password;
@@ -3458,6 +4263,36 @@ export function register(addon: any, options: { loginRateLimit?: any; enabled?: 
     const { forgetImported } = require('./playstateSync');
     const removed = await forgetImported(userUUID, profileKey(scoped));
     res.json({ removed });
+  });
+
+  addon.post('/api/jellyfin/:userUUID/import-watchlist', gate, approveRateLimit, async (req: any, res: any) => {
+    const userUUID = String(req.params.userUUID);
+    const password = req.body?.password;
+
+    const accountId = req.session?.accountId;
+    const owns = require('../jellyfinAdmin/adminAuth').isDashboardAdmin(req) || (Boolean(accountId) && (await database.ownsConfig(accountId, userUUID)));
+    const verified = !owns && password ? await database.verifyUserAndGetConfig(userUUID, String(password)) : null;
+    if (!owns && !verified) {
+      res.status(401).json({ error: 'Sign in or enter the configuration password to import a watchlist' });
+      return;
+    }
+
+    const { WATCHLIST_SERVICES } = require('./watchlistSources');
+    const services = (Array.isArray(req.body?.services) ? req.body.services : []).map(String).filter((service: string) => WATCHLIST_SERVICES.includes(service));
+    if (!services.length) {
+      res.status(400).json({ error: 'Pick a service to import from' });
+      return;
+    }
+    const config = verified ?? (await database.getUserConfig(userUUID).catch(() => null));
+    const requested = typeof req.body?.profile === 'string' && req.body.profile ? req.body.profile : null;
+    const scoped = scopeConfigToProfile(config, userUUID, requested);
+    const { importWatchlist } = require('./watchlist');
+    const result = await importWatchlist(userUUID, scoped, services);
+    if (!result) {
+      res.status(409).json({ error: 'That service is not connected in the saved configuration. Save first, then import.' });
+      return;
+    }
+    res.json(result);
   });
 }
 

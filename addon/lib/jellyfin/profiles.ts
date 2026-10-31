@@ -3,6 +3,8 @@ import { allowsUnrated, hasAgeRatingCap, passesAgeRating, resolveInstallFilters 
 import { normaliseJellyfinId } from './idsCodec';
 import { isPinHash } from './pins';
 import { ACCOUNT_SERVICES, ACCOUNT_SERVICE_LIST, AccountService, accountOwner, credentialOf, trackerConfig, withAccountOwner } from '../accounts';
+import { viewingWindowOf, type ViewingWindow } from './viewingHours';
+import { withTagExclusions } from '../../utils/tagExclusions';
 
 /** The main user is the configuration itself, under the id it always had. */
 export interface Profile {
@@ -25,6 +27,8 @@ export interface Profile {
   streamUrl?: string;
   /** Hash of the PIN asked before anyone becomes this user. */
   pin?: string;
+  viewingHours?: ViewingWindow[];
+  downloads?: boolean;
 }
 
 export function defaultUserName(config: any, userUUID: string): string {
@@ -62,6 +66,15 @@ function knownTags(config: any, wanted: unknown): string[] {
   return out;
 }
 
+function tagRules(config: any, tags: string[]): { viewingHours: ViewingWindow[]; downloads: boolean } {
+  const wanted = new Set(tags.map((t) => t.toLowerCase()));
+  const defined = (Array.isArray(config?.tags) ? config.tags : []).filter((tag: any) => typeof tag?.name === 'string' && wanted.has(tag.name.trim().toLowerCase()));
+  return {
+    viewingHours: defined.map((tag: any) => viewingWindowOf(tag.viewingHours)).filter(Boolean) as ViewingWindow[],
+    downloads: !defined.some((tag: any) => tag.allowDownloads === false),
+  };
+}
+
 function namesOf(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const out: string[] = [];
@@ -73,14 +86,17 @@ function namesOf(value: unknown): string[] {
 }
 
 export function listProfiles(config: any, userUUID: string): Profile[] {
+  const mainTags = knownTags(config, config?.jellyfinUserTags);
   const profiles: Profile[] = [{
     id: null,
     name: defaultUserName(config, userUUID),
     userId: profileUserId(userUUID, null),
     avatar: avatarOf(config?.jellyfinUserAvatar),
-    tags: knownTags(config, config?.jellyfinUserTags),
+    tags: mainTags,
+    ...tagRules(config, mainTags),
     handoffNames: namesOf(config?.jellyfinUserHandoffNames),
     sharesHistory: true,
+    pin: isPinHash(config?.jellyfinUserPin) ? config.jellyfinUserPin : undefined,
   }];
   const seen = new Set<string>();
 
@@ -89,12 +105,14 @@ export function listProfiles(config: any, userUUID: string): Profile[] {
     const name = typeof user?.name === 'string' ? user.name.trim() : '';
     if (!id || !name || seen.has(id)) continue;
     seen.add(id);
+    const tags = knownTags(config, user.tags);
     profiles.push({
       id,
       name,
       userId: profileUserId(userUUID, id),
       avatar: avatarOf(user.avatar),
-      tags: knownTags(config, user.tags),
+      tags,
+      ...tagRules(config, tags),
       handoffNames: namesOf(user.handoffNames),
       sharesHistory: user.trackers === true,
       trackerSource: typeof user.trackerSource === 'string' ? user.trackerSource : undefined,
@@ -148,7 +166,7 @@ function heldTrackerSource(held: any, trackerSource: string): string {
 /** A holder's watchlist picks, dropping any whose service it doesn't hold; undefined once none are left. */
 function heldWatchlistServices(held: any, watchlistServices: string[]): string[] | undefined {
   if (watchlistServices.includes('none')) return watchlistServices;
-  const kept = watchlistServices.filter((token) => isHeldForWatchlist(held, token.split(':')[0] as AccountService));
+  const kept = watchlistServices.filter((token) => token === 'server' || isHeldForWatchlist(held, token.split(':')[0] as AccountService));
   return kept.length ? kept : undefined;
 }
 
@@ -157,8 +175,9 @@ export function scopeConfigToProfile(config: any, userUUID: string, id: string |
   const profile = profileById(config, userUUID, id);
   if (!profile.id && !profile.tags.length) return config;
 
-  const held = profile.id ? withAccountOwner(config, profile.id) : config;
-  const owns = held !== config;
+  const owner = profile.id ? withAccountOwner(config, profile.id) : config;
+  const owns = owner !== config;
+  const held = profile.id && !profile.sharesHistory && !owns ? { ...owner, jellyfinAccounts: {} } : owner;
   // The main user keeps its own history and trackers whatever tags it picks.
   const scoped = profile.id
     ? {
@@ -181,7 +200,7 @@ export function scopeConfigToProfile(config: any, userUUID: string, id: string |
     if (ageRating) scoped.ageRating = ageRating;
     if (allowUnrated === false) scoped.allowUnratedContent = false;
   }
-  return scoped;
+  return withTagExclusions(scoped, profile.tags);
 }
 
 /** The tags a scoped configuration lists catalogs for; none means all of them. */
@@ -232,12 +251,17 @@ export function hasNamedViewers(config: any, userUUID: string): boolean {
   return others.length > 0 || main.handoffNames.length > 0;
 }
 
+/** The user a handoff request names: null when it names nobody, undefined when it names nobody here while others could be named. */
+export function profileForViewer(config: any, userUUID: string, name: unknown): Profile | null | undefined {
+  if (name === undefined || name === null || (typeof name === 'string' && !name.trim())) return null;
+  if (!hasNamedViewers(config, userUUID)) return null;
+  if (typeof name !== 'string') return undefined;
+  return viewerByName(config, userUUID, name);
+}
+
 /** The config a handoff request acts as; undefined when it names nobody here while others could be named. */
 export function configForViewer(config: any, userUUID: string, name: unknown): any | undefined {
-  if (name === undefined || name === null || (typeof name === 'string' && !name.trim())) return config;
-  if (!hasNamedViewers(config, userUUID)) return config;
-  if (typeof name !== 'string') return undefined;
-  const profile = viewerByName(config, userUUID, name);
-  if (!profile) return undefined;
-  return profile.id ? scopeConfigToProfile(config, userUUID, profile.id) : config;
+  const profile = profileForViewer(config, userUUID, name);
+  if (profile === undefined) return undefined;
+  return profile?.id ? scopeConfigToProfile(config, userUUID, profile.id) : config;
 }

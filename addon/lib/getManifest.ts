@@ -10,8 +10,10 @@ import catalogsTranslationsJson from "../static/translations.json";
 import catalogTypesJson from "../static/catalog-types.json";
 import { PLAYBACK_MANIFEST_EVENTS, WATCH_STATE_PUSH_EVENTS, WATCH_STATE_VERSION } from "./playbackHandler";
 import { watchStatePullTtl } from "./watchState";
-import { collectionCatalogs, collectionsServed, COLLECTION_META_PREFIX } from "./collectionBuilder/aiostreamsCollections";
-import { holderCards, servesCatalog, withAccountOwner } from "./accounts";
+import { collectionCatalogs, collectionsServed, COLLECTION_CATALOG_PREFIX, COLLECTION_META_PREFIX } from "./collectionBuilder/aiostreamsCollections";
+import { configCatalogFor, placeCollections } from "./collectionBuilder/homeOrder";
+import { similarCatalogs } from "./similarCatalog";
+import { holderCards, rowOwner, servesCatalog, withAccountOwner } from "./accounts";
 import { hasNamedViewers } from "./jellyfin/profiles";
 const jikan: any = require('./mal');
 const DEFAULT_LANGUAGE = "en-US";
@@ -688,6 +690,21 @@ function createPublicMetaDBCatalog(userCatalog: any, showPrefix: boolean = false
   }
 }
 
+function createServerWatchlistCatalog(userCatalog: any, showPrefix: boolean = false, prefixName: string = "AIOMetadata"): any {
+  const extra: any[] = [{ name: "skip" }];
+  if (!userCatalog.showInHome) {
+    extra.unshift({ name: "genre", options: ["None"], isRequired: true });
+  }
+  return {
+    id: userCatalog.id,
+    type: userCatalog.displayType || userCatalog.type,
+    name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name || 'Watchlist'}`,
+    pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
+    extra,
+    showInHome: userCatalog.showInHome ?? false
+  };
+}
+
 function createMergedCatalog(
   userCatalog: any,
   allBuiltCatalogs: any[],
@@ -895,7 +912,8 @@ async function lumiereGenreOptions(): Promise<Record<'movie' | 'series', string[
   }
 }
 
-async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise<any> {
+/** `viewer`, a named user's scoped config, decides which account rows are listed. */
+async function getManifest(config: any, opts: { tags?: string[]; userUUID?: string; viewer?: any } = {}): Promise<any> {
   const startTime = Date.now();
   logger.start('Starting manifest generation...');
 
@@ -909,8 +927,9 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
   // any one of them is in, so several profiles install as a single addon.
   const tags = Array.isArray(opts.tags) ? opts.tags.filter(Boolean) : [];
   const tagSet = new Set(tags.map((t: string) => t.toLowerCase()));
+  const jikanEnabled = jikan.isJikanEnabled();
   const enabledCatalogs = userCatalogs.filter((c: any) =>
-    c.enabled && servesCatalog(config, c) && (tagSet.size === 0 || (Array.isArray(c.tags) && c.tags.some((t: any) => tagSet.has(String(t).toLowerCase()))))
+    c.enabled && servesCatalog(opts.viewer ?? config, c) && (jikanEnabled || !jikan.isJikanCatalogId(c.id)) && (tagSet.size === 0 || rowOwner(c) || (Array.isArray(c.tags) && c.tags.some((t: any) => tagSet.has(String(t).toLowerCase()))))
   );
 
   // Absorbed merge sources must be built (even if disabled) so their genres feed the parent.
@@ -923,7 +942,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
   }
   const enabledKeys = new Set(enabledCatalogs.map((c: any) => `${c.id}:${c.type}`));
   const absorbedSourceCatalogs = userCatalogs.filter((c: any) =>
-    mergedSourceKeys.has(`${c.id}:${c.type}`) && !enabledKeys.has(`${c.id}:${c.type}`)
+    mergedSourceKeys.has(`${c.id}:${c.type}`) && !enabledKeys.has(`${c.id}:${c.type}`) && (jikanEnabled || !jikan.isJikanCatalogId(c.id))
   );
   const absorbedKeys = new Set<string>(absorbedSourceCatalogs.map((c: any) => `${c.id}:${c.type}`));
 
@@ -1096,6 +1115,9 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
     }
   }
 
+  const readsHistory = userCatalogs.some((c: any) => c.id?.startsWith('recommendations.'))
+    && await require('../utils/recommendations/history').canReadHistory(config, opts.userUUID ?? config.userUUID ?? '');
+
   const pass1UserCatalogs = [...enabledCatalogs, ...absorbedSourceCatalogs].filter((userCatalog: any) => {
       if (userCatalog.id.startsWith('merged.')) {
         return false; // handled in pass 2 (needs source manifest entries to be built first)
@@ -1112,7 +1134,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
       }
       if (userCatalog.id.startsWith('recommendations.')) {
         // Needs a history to read and a model to read it with.
-        const hasHistory = !!(config.apiKeys?.simklTokenId || config.apiKeys?.mdblist);
+        const hasHistory = readsHistory;
         const hasModel = !!(config.apiKeys?.gemini || config.apiKeys?.openrouter
           || process.env.GEMINI_API_KEY || process.env.BUILT_IN_GEMINI_API_KEY || process.env.OPENROUTER_API_KEY);
         return hasHistory && hasModel;
@@ -1160,6 +1182,9 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
         return true;
       }
       if (isPublicMetaDB(userCatalog.id)) {
+        return true;
+      }
+      if (userCatalog.id.startsWith('aiom.watchlist.')) {
         return true;
       }
       if (!catalogDef) {
@@ -1242,6 +1267,9 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
           logger.debug(`Processing PublicMetaDB catalog: ${userCatalog.id}`);
           const result = createPublicMetaDBCatalog(userCatalog, showPrefix, prefixName);
           return result;
+      }
+      if (userCatalog.id.startsWith('aiom.watchlist.')) {
+          return createServerWatchlistCatalog(userCatalog, showPrefix, prefixName);
       }
       if (userCatalog.id.startsWith('tmdb.list.')) {
           logger.debug(`Processing TMDB List catalog: ${userCatalog.id}`);
@@ -1653,7 +1681,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
           extra: [{ name: 'search', isRequired: true }, { name: 'skip' }]
         });
       });
-    const isMalSearchInUse = Object.entries(searchProviders).some(
+    const isMalSearchInUse = jikanEnabled && Object.entries(searchProviders).some(
       ([, providerId]: [string, any]) =>
         typeof providerId === 'string' &&
         providerId.startsWith('mal.search') &&
@@ -1697,8 +1725,14 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
     });
   }
 
-  // Listed first, as on the Jellyfin server.
-  catalogs.unshift(...collectionCatalogs(config, tags));
+  catalogs = placeCollections(
+    config,
+    catalogs,
+    (catalog: any) => configCatalogFor(config, catalog),
+    collectionCatalogs(config, tags),
+    (catalog: any) => catalog.id.slice(COLLECTION_CATALOG_PREFIX.length)
+  );
+  catalogs.push(...similarCatalogs(config));
 
   const nameSuffix = process.env.ADDON_NAME_SUFFIX || "";
   const baseName = config.addonName || (nameSuffix ? `AIOMetadata ${nameSuffix}` : "AIOMetadata");
@@ -1712,7 +1746,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
   if (watchTrackingEnabled) {
     resources.push("subtitles");
   }
-  if(config.showRateMeButton) {
+  if (config.showRateMeButton && !config.catalogModeOnly) {
     resources.push("stream");
   }
 
@@ -1744,7 +1778,7 @@ async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise
           playback: { version: 1, events: PLAYBACK_MANIFEST_EVENTS },
         }
       : {}),
-    types: ["movie", "series", "anime.movie", "anime.series", "anime", "Trakt", "collection"],
+    types: ["movie", "series", "anime.movie", "anime.series", "anime", "Trakt", "collection", ...(config.catalogModeOnly ? [] : ["person"])],
     idPrefixes: ["tmdb:", "tt", "tvdb:", "mal:", "tvmaze:", "kitsu:", "anidb:", "anilist:", "tvdbc:", "upnext_", "unwatched_", "mdblist_upnext_", "pmdb_resume_", "simkl_upnext_", "aiom.error.", ...(collectionsServed(config) ? [COLLECTION_META_PREFIX] : [])],
     stremioAddonsConfig: {
       "issuer": "https://stremio-addons.net",

@@ -27,6 +27,7 @@ interface ResolvedSeriesIds {
   fallbackData?: any;
   season: number;
   episode: number;
+  episodeIds?: Record<string, number>;
 }
 
 function parseMediaId(id: any): ParsedMediaId | null {
@@ -81,7 +82,7 @@ function parseMediaId(id: any): ParsedMediaId | null {
       const [seasonStr, episodeStr] = rest;
       const season = parseInt(seasonStr, 10);
       const episode = parseInt(episodeStr, 10);
-      if (Number.isNaN(season) || season < 1 || season > 999) {
+      if (Number.isNaN(season) || season < 1 || season > 9999) {
         logger.debug(`[Watch Tracking] Invalid season value in IMDb ID: season=${seasonStr}`);
         return null;
       }
@@ -136,7 +137,7 @@ function parseMediaId(id: any): ParsedMediaId | null {
     const [seasonStr, episodeStr] = rest.slice(1);
     const season = parseInt(seasonStr, 10);
     const episode = parseInt(episodeStr, 10);
-    if (Number.isNaN(season) || season < 1 || season > 999) {
+    if (Number.isNaN(season) || season < 1 || season > 9999) {
       logger.debug(`[Watch Tracking] Invalid season value for provider ${provider}: ${seasonStr}`);
       return null;
     }
@@ -285,14 +286,9 @@ function normalizeIdsForMovie(parsedId: ParsedMediaId): Record<string, any> | nu
         return null;
       }
 
-      const mapping = idMapper.getMappingByKitsuId(kitsuId);
-      const malId = mapping?.mal_id;
-      if (malId) {
-        const traktMovie = idMapper.getTraktAnimeMovieByMalId(malId);
-        const imdbId = traktMovie?.externals?.imdb;
-        if (imdbId) {
-          return { imdb: imdbId };
-        }
+      const { imdbId } = idMapper.filmIdsFor(idMapper.getMappingByKitsuId(kitsuId));
+      if (imdbId) {
+        return { imdb: imdbId };
       }
 
       logger.debug(`[Watch Tracking] Falling back to Kitsu ID for movie ${parsedId.id}`);
@@ -302,6 +298,31 @@ function normalizeIdsForMovie(parsedId: ParsedMediaId): Record<string, any> | nu
       logger.debug(`[Watch Tracking] Unsupported movie provider: ${parsedId.provider}`);
       return null;
   }
+}
+
+async function byTvdbEpisode(tvdbId: number, season: number, episode: number, config: any): Promise<ResolvedSeriesIds> {
+  const listed = await require('./tvdb').getSeriesEpisodes(String(tvdbId), 'en-US', 'default', config).catch(() => null);
+  const found = (listed?.episodes ?? []).find((entry: any) => Number(entry?.seasonNumber) === season && Number(entry?.number) === episode);
+  return { ids: { tvdb: tvdbId }, season, episode, ...(found?.id ? { episodeIds: { tvdb: Number(found.id) } } : {}) };
+}
+
+async function inTmdbNumbers(resolution: ResolvedSeriesIds, config: any, provider: string): Promise<ResolvedSeriesIds> {
+  const apiKey = config?.apiKeys?.mdblist;
+  if (!apiKey || (provider === 'imdb' && config?.providers?.series !== 'tvdb')) return resolution;
+  let tmdb = Number(resolution.ids.tmdb) || null;
+  let tvdb = Number(resolution.ids.tvdb) || null;
+  if (!tmdb) {
+    const seed = resolution.ids.imdb ? String(resolution.ids.imdb) : tvdb ? `tvdb:${tvdb}` : null;
+    const all = seed ? await require('./id-resolver').resolveAllIds(seed, 'series', config, {}, ['tmdb', 'tvdb']).catch(() => null) : null;
+    tmdb = Number(all?.tmdbId) || null;
+    tvdb = tvdb || Number(all?.tvdbId) || null;
+  }
+  if (!tmdb) return resolution;
+  const { withEpisodeOrder } = require('../utils/episodeOrder');
+  if ((withEpisodeOrder(config, tvdb).tvdbSeasonType || 'default') !== 'default') return resolution;
+  const moved = await require('../utils/mdbList').tmdbEpisodeFromTvdb(tmdb, resolution.season, resolution.episode, apiKey).catch(() => null);
+  if (moved?.showTmdb) return { ...resolution, ids: { tmdb: moved.showTmdb }, season: moved.season, episode: moved.episode };
+  return moved ? { ...resolution, ids: { ...resolution.ids, tmdb }, season: moved.season, episode: moved.episode } : resolution;
 }
 
 async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSimkl: boolean = false): Promise<ResolvedSeriesIds | null> {
@@ -326,6 +347,9 @@ async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSim
                 const resolved = await resolveTmdbEpisodeFromKitsu(
                   anilistMapping.kitsu_id, anidbInfo.anidbEpisode, config
                 );
+                if (resolved?.isFranchiseFallback && (Number(resolved.seasonNumber) !== (parsedId.season || 1) || Number(resolved.episodeNumber) !== Number(parsedId.episode))) {
+                  return byTvdbEpisode(Number(animeMapping.tvdb_id), parsedId.season || 1, Number(parsedId.episode), config);
+                }
                 if (resolved) {
                   logger.debug(
                     `[Watch Tracking] Resolved anime IMDB ${parsedId.id} → TVDB ${animeMapping.tvdb_id} → AniDB ${anidbInfo.anidbId} → AniList ${anidbMapping.anilist_id} → Kitsu ${anilistMapping.kitsu_id} → TMDB ${resolved.tmdbId} S${resolved.seasonNumber}E${resolved.episodeNumber}`
@@ -343,23 +367,23 @@ async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSim
           logger.debug(`[Watch Tracking] Anime IMDB resolution failed for ${parsedId.id}: ${error.message}`);
         }
       }
-      return {
-        ids: { imdb: parsedId.id },
-        season: parsedId.season!,
-        episode: parsedId.episode!
-      };
+      const byImdb = { ids: { imdb: parsedId.id }, season: parsedId.season!, episode: parsedId.episode! };
+      return isSimkl ? byImdb : inTmdbNumbers(byImdb, config, 'imdb');
     }
-    case 'tvdb':
-      return {
-        ids: { tvdb: parseInt(parsedId.id, 10) },
-        season: parsedId.season!,
-        episode: parsedId.episode!
-      };
+    case 'tvdb': {
+      const byTvdb = { ids: { tvdb: parseInt(parsedId.id, 10) }, season: parsedId.season!, episode: parsedId.episode! };
+      return isSimkl ? byTvdb : inTmdbNumbers(byTvdb, config, 'tvdb');
+    }
     case 'tmdb': {
       const mapping = idMapper.getMappingByTmdbId(parsedId.id, 'series');
       if (!mapping) {
-        logger.debug(`[Watch Tracking] No mapping found for TMDB series ${parsedId.id}`);
-        return null;
+        const regular = require('./id-mappings').getByTmdbId(parsedId.id, 'series');
+        const all = regular?.imdbId || regular?.tvdbId
+          ? null
+          : await require('./id-resolver').resolveAllIds(`tmdb:${parsedId.id}`, 'series', config, {}, ['imdb', 'tvdb']).catch(() => null);
+        const imdb = regular?.imdbId || all?.imdbId || null;
+        const tvdb = Number(regular?.tvdbId || all?.tvdbId) || null;
+        return { ids: { tmdb: parseInt(parsedId.id, 10), ...(imdb ? { imdb } : {}), ...(tvdb ? { tvdb } : {}) }, season: parsedId.season!, episode: parsedId.episode! };
       }
       const ids: Record<string, any> = {};
       if (mapping.imdb_id) ids.imdb = mapping.imdb_id;
@@ -382,6 +406,19 @@ async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSim
           config
         );
 
+        const kitsuMapping = idMapper.getMappingByKitsuId(parseInt(parsedId.id, 10));
+        const tmdbGone = !resolved && kitsuMapping?.themoviedb_id
+          ? !(await require('./getTmdb').tvInfo({ id: kitsuMapping.themoviedb_id }, config).catch(() => true))
+          : false;
+        if (tmdbGone || resolved?.isFranchiseFallback) {
+          const anidbId = kitsuMapping?.anidb_id;
+          const tvdbInfo = anidbId ? resolveTvdbEpisodeFromAnidbEpisode(anidbId, 1, parseInt(String(parsedId.episode), 10)) : null;
+          if (tvdbInfo && (!resolved || Number(tvdbInfo.tvdbSeason) !== Number(resolved.seasonNumber) || Number(tvdbInfo.tvdbEpisode) !== Number(resolved.episodeNumber))) {
+            logger.debug(`[Watch Tracking] Kitsu ${parsedId.id} sent by its TVDB episode S${tvdbInfo.tvdbSeason}E${tvdbInfo.tvdbEpisode}`);
+            return byTvdbEpisode(Number(tvdbInfo.tvdbId), Number(tvdbInfo.tvdbSeason), Number(tvdbInfo.tvdbEpisode), config);
+          }
+        }
+
         if (!resolved) {
           logger.debug(`[Watch Tracking] Could not resolve Kitsu → TMDB for Kitsu series ${parsedId.id}`);
           return null;
@@ -389,7 +426,7 @@ async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSim
       } else {
         const mappings = idMapper.getMappingByKitsuId(parseInt(parsedId.id, 10));
         const malId = mappings?.mal_id || null;
-        const anidbId = mappings.anidb_id;
+        const anidbId = mappings?.anidb_id;
         let tvdbInfo: any;
         if (anidbId) {
           tvdbInfo = resolveTvdbEpisodeFromAnidbEpisode(anidbId, 1, parseInt(String(parsedId.episode), 10));
@@ -411,6 +448,11 @@ async function resolveSeriesIds(parsedId: ParsedMediaId, config: any = {}, isSim
         }
       }
 
+      resolved = resolved ?? fallback;
+      if (!resolved) {
+        logger.debug(`[Watch Tracking] No ids for Kitsu series ${parsedId.id}`);
+        return null;
+      }
       return {
         ids: { tmdb: resolved.tmdbId, mal: resolved.malId, tvdb: resolved.tvdbId },
         fallbackData: fallback?.malId ? { ids: { mal: fallback.malId }, season: 1, episode: fallback.episodeNumber } : null,
@@ -521,7 +563,10 @@ async function eachHistoryService(
 ): Promise<void> {
   for (const service of ['simkl', 'mdblist'] as const) {
     if (only && only !== service) continue;
-    if (!shouldTrackServiceMediaType(config, service, mediaType)) continue;
+    if (!shouldTrackServiceMediaType(config, service, mediaType)) {
+      if (only) logger.debug(`[${service}] ${what} skipped: watch tracking is off for ${mediaType}`);
+      continue;
+    }
     try {
       let utils: any;
       let credential: string | undefined;
@@ -536,7 +581,10 @@ async function eachHistoryService(
         const token = await utils.getSimklToken(tokenId);
         credential = token?.access_token;
       }
-      if (!credential) continue;
+      if (!credential) {
+        logger.debug(`[${service}] ${what} skipped: no usable credential`);
+        continue;
+      }
 
       if (parsedId.type === 'movie') {
         const ids = normalizeIdsForMovie(parsedId);
@@ -545,7 +593,10 @@ async function eachHistoryService(
         const resolution = await resolveSeriesIds(parsedId, config, service === 'simkl');
         if (resolution) {
           const ids = await withTmdbId(resolution.ids, 'series');
-          await utils[method](ids, credential, resolution.season, resolution.episode);
+          const byId = resolution.episodeIds ? [{ season: resolution.season, episode: resolution.episode, ids: resolution.episodeIds }] : undefined;
+          await utils[method](ids, credential, resolution.season, resolution.episode, byId);
+        } else {
+          logger.debug(`[${service}] ${what} skipped: no ids for ${parsedId.provider}:${parsedId.id}`);
         }
       }
     } catch (error: any) {
@@ -583,14 +634,14 @@ async function markEpisodes(
       }
       if (!credential) continue;
 
-      const groups = new Map<string, { ids: Record<string, any>; episodes: Array<{ season: number; episode: number }> }>();
+      const groups = new Map<string, { ids: Record<string, any>; episodes: Array<{ season: number; episode: number; ids?: Record<string, number> }> }>();
       for (const id of parsed) {
         const resolution = await resolveSeriesIds(id, config, service === 'simkl');
         if (!resolution) continue;
         const ids = await withTmdbId(resolution.ids, 'series');
         const key = JSON.stringify(ids);
         const group = groups.get(key) ?? { ids, episodes: [] };
-        group.episodes.push({ season: resolution.season, episode: resolution.episode });
+        group.episodes.push({ season: resolution.season, episode: resolution.episode, ...(resolution.episodeIds ? { ids: resolution.episodeIds } : {}) });
         groups.set(key, group);
       }
       for (const group of groups.values()) {
@@ -728,7 +779,7 @@ async function clearMdblistResumePoint(
 async function checkinSimkl(
   parsedId: ParsedMediaId,
   config: any,
-  options: { action?: 'checkin' | 'start' | 'pause' | 'stop'; progress?: number } = {}
+  options: { action?: 'checkin' | 'start' | 'pause' | 'stop'; progress?: number; minProgress?: number } = {}
 ): Promise<void> {
   try {
     const { checkinSeries, checkinMovie, getSimklToken } = require('../utils/simklUtils');
@@ -744,6 +795,8 @@ async function checkinSimkl(
       logger.warn(`[Simkl Checkin] Skipping checkin - missing or invalid Simkl token for tokenId ${tokenId}`);
       return;
     }
+    const marks = options.action !== 'start' && options.action !== 'pause';
+    const sent = { ...options, rewatch: marks && await require('../utils/simklUtils').simklKeepsRewatches(accessToken) };
 
     if (parsedId.type === 'movie') {
       const normalized = normalizeIdsForMovie(parsedId);
@@ -754,7 +807,7 @@ async function checkinSimkl(
       const ids = await withTmdbId(normalized, 'movie');
 
       logger.debug(`[Simkl Checkin] Tracking movie (${buildIdSummary(ids)})`);
-      await checkinMovie(ids, accessToken, options);
+      await checkinMovie(ids, accessToken, sent);
       return;
     }
 
@@ -769,7 +822,7 @@ async function checkinSimkl(
       logger.debug(
         `[Simkl Checkin] Checkin in episode (${buildIdSummary(ids)}) S${resolution.season}E${resolution.episode}`
       );
-      await checkinSeries(ids, resolution.season, resolution.episode, accessToken, resolution.fallbackData, options);
+      await checkinSeries(ids, resolution.season, resolution.episode, accessToken, resolution.fallbackData, sent);
       return;
     }
 

@@ -12,7 +12,7 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
   const database: any = require('../database');
   const { parseStremioId } = require('./ids');
   const { envInt } = require('../../utils/envNumber');
-  const { videoIdAliases } = require('./aliases');
+  const { videoIdAliases, groupBySpelling } = require('./aliases');
 
   const since = Date.now() - envInt('JELLYFIN_NEXTUP_OWN_DAYS', 120, 1) * 24 * 60 * 60 * 1000;
   const shows = envInt('JELLYFIN_NEXTUP_OWN_LIMIT', 300, 1);
@@ -21,7 +21,9 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
 
   const rows: NextUpRow[] = [];
   const seen = new Set<string>();
+  const handled = new Set<string>();
   let after: { at: number; videoId: string } | null = null;
+  let carry: any[] = [];
   for (let scanned = 0; rows.length < shows && scanned < scanCap; scanned += batch) {
     let records: any[];
     try {
@@ -31,21 +33,41 @@ export async function ownNextUpRows(userUUID: string, profile: string): Promise<
     }
     const last = records[records.length - 1];
     if (last) after = { at: Number(last.last_played_at), videoId: String(last.video_id) };
+    const groupOf = new Map<string, any[]>();
+    for (const group of (await groupBySpelling([...carry, ...records])) as any[][]) {
+      for (const row of group) groupOf.set(String(row.video_id), group);
+    }
+    carry = last ? records.filter((row) => Number(row.last_played_at) === Number(last.last_played_at)) : [];
     for (const r of records) {
       if (rows.length >= shows) break;
       const parsed = parseStremioId(String(r.video_id));
-      if (!parsed || parsed.episode === null || parsed.episode === undefined || seen.has(parsed.base)) continue;
-      seen.add(parsed.base);
+      if (!parsed || parsed.episode === null || parsed.episode === undefined) continue;
+      const group = groupOf.get(String(r.video_id)) ?? [r];
+      if (seen.has(parsed.base) || group.some((row: any) => handled.has(String(row.video_id)))) continue;
+      for (const row of group) {
+        handled.add(String(row.video_id));
+        const base = parseStremioId(String(row.video_id))?.base;
+        if (base) seen.add(base);
+      }
       for (const alias of await videoIdAliases(String(r.video_id))) {
         const base = parseStremioId(alias)?.base;
         if (base) seen.add(base);
       }
+      let lead = r;
+      let leadParsed = parsed;
+      for (const row of group) {
+        if (Number(row.last_played_at) !== Number(r.last_played_at) || !(Number(row.updated_at) < Number(lead.updated_at))) continue;
+        const spelled = parseStremioId(String(row.video_id));
+        if (!spelled || spelled.episode === null || spelled.episode === undefined) continue;
+        lead = row;
+        leadParsed = spelled;
+      }
       rows.push({
-        metaId: parsed.base,
-        videoId: String(r.video_id),
-        season: parsed.season ?? null,
-        episode: parsed.episode,
-        mediaType: parsed.idType === 'kitsu' || parsed.idType === 'mal' || parsed.idType === 'anilist' ? 'anime' : 'series',
+        metaId: leadParsed.base,
+        videoId: String(lead.video_id),
+        season: leadParsed.season ?? null,
+        episode: leadParsed.episode,
+        mediaType: leadParsed.idType === 'kitsu' || leadParsed.idType === 'mal' || leadParsed.idType === 'anilist' ? 'anime' : 'series',
         lastWatchedAt: Number(r.last_played_at) || Number(r.updated_at) || 0,
       });
     }
@@ -66,6 +88,8 @@ export interface NextUpRow {
   airsAt?: number | null;
   /** The tracker says the episode is out: its next airing is a later one, or the show has finished. */
   aired?: boolean;
+  /** Where the tracker's own Up Next places the show, when it ranks one. */
+  trackerRank?: number;
 }
 
 export interface HistoryEntry {
@@ -99,7 +123,16 @@ export interface WatchedSnapshot {
   dropped: Set<string>;
   /** The drops could not be read, so `dropped` is not the whole list. */
   droppedUnread?: boolean;
+  /** Anime entries the tracker lists as completed. */
+  finishedAnime?: FinishedAnime[];
+  /** Every entry on the tracker's lists, as `mal:` and `simkl:` keys. */
+  listedAnime?: Set<string>;
   fingerprint: string;
+}
+
+export interface FinishedAnime {
+  ids: { simkl?: number; mal?: number; anilist?: number; kitsu?: number; anidb?: number };
+  at: number;
 }
 
 const EMPTY: WatchedSnapshot = { source: null, nextUp: [], following: [], dropped: new Set(), fingerprint: '' };
@@ -117,6 +150,8 @@ interface Collecting {
   /** When a video was last watched, by video id, where the tracker says. */
   at: Map<string, number>;
   dropped: Set<string>;
+  finishedAnime?: FinishedAnime[];
+  listedAnime?: Set<string>;
 }
 
 /** Every id a series might be addressed by, so a lookup needs no id space. */
@@ -169,15 +204,38 @@ function parseNextToWatch(value: any): { season: number | null; episode: number 
 function collectShow(entry: any, snapshot: Collecting, isAnime: boolean, history: Map<string, HistoryEntry>): void {
   const ids = entry?.show?.ids ?? {};
   const keys = seriesKeys(ids);
+  const film = isAnime && entry?.anime_type === 'movie';
 
   const metaId = isAnime && ids.kitsu
     ? `kitsu:${ids.kitsu}`
     : (ids.imdb ? String(ids.imdb) : ids.tvdb ? `tvdb:${ids.tvdb}` : null);
-  if (metaId && entry?.status === 'watching') {
+  if (metaId && entry?.status === 'watching' && !film) {
     snapshot.following.push({ metaId, mediaType: isAnime && ids.kitsu ? 'anime' : 'series' });
+  }
+  if (ids.mal) snapshot.listedAnime?.add(`mal:${ids.mal}`);
+  if (ids.simkl) snapshot.listedAnime?.add(`simkl:${ids.simkl}`);
+  if (isAnime && entry?.status === 'completed') {
+    const numbered: FinishedAnime['ids'] = {};
+    for (const key of ['simkl', 'mal', 'anilist', 'kitsu', 'anidb'] as const) {
+      const value = Number(ids[key]);
+      if (Number.isInteger(value) && value > 0) numbered[key] = value;
+    }
+    snapshot.finishedAnime?.push({ ids: numbered, at: Date.parse(entry?.last_watched_at ?? '') || 0 });
   }
   // An older Simkl app is sent `notinteresting` where a newer one gets `dropped`.
   if (entry?.status === 'dropped' || entry?.status === 'notinteresting') for (const key of seriesKeysWithKitsu(ids)) snapshot.dropped.add(key);
+
+  if (film) {
+    if (entry?.status !== 'completed') return;
+    const at = Date.parse(entry?.last_watched_at ?? '') || 0;
+    const spellings = [ids.imdb ? String(ids.imdb) : null, ids.tmdb ? `tmdb:${ids.tmdb}` : null, ids.kitsu ? `kitsu:${ids.kitsu}` : null, ids.mal ? `mal:${ids.mal}` : null].filter(Boolean) as string[];
+    for (const id of spellings) {
+      snapshot.movies.add(id);
+      if (at) snapshot.at.set(id, at);
+    }
+    if (spellings.length) recordWatch(history, { kind: 'movie', id: spellings[0], mediaType: 'movie', at });
+    return;
+  }
 
   // Simkl names a next episode for every listed show, a planned or dropped one
   // included; only a show being watched belongs on the shelf.
@@ -262,6 +320,8 @@ interface RawSnapshot {
   following?: Array<{ metaId: string; mediaType: 'anime' | 'series' }>;
   dropped?: string[];
   droppedUnread?: boolean;
+  finishedAnime?: FinishedAnime[];
+  listedAnime?: string[];
 }
 
 /** A Simkl library, as `/sync/all-items` returns it, made into a snapshot. */
@@ -274,6 +334,8 @@ export function assembleSimkl(data: any): RawSnapshot {
     following: [],
     at: new Map(),
     dropped: new Set(),
+    finishedAnime: [],
+    listedAnime: new Set(),
   };
   const history = new Map<string, HistoryEntry>();
 
@@ -301,6 +363,8 @@ export function assembleSimkl(data: any): RawSnapshot {
     nextUp: snapshot.nextUp.sort((a, b) => b.lastWatchedAt - a.lastWatchedAt),
     following: snapshot.following,
     dropped: [...snapshot.dropped],
+    finishedAnime: snapshot.finishedAnime,
+    listedAnime: [...(snapshot.listedAnime ?? [])],
   };
 }
 
@@ -318,7 +382,7 @@ export interface AnimeListEntry {
 
 export async function assembleAnimeList(entries: AnimeListEntry[]): Promise<RawSnapshot> {
   const idMapper: any = require('../id-mapper');
-  const { videoIdAliases } = require('./aliases');
+  const { videoIdAliases, groupBySpelling } = require('./aliases');
   const snapshot: Collecting = {
     episodes: new Set(),
     movies: new Set(),
@@ -407,6 +471,7 @@ export async function assembleAnimeList(entries: AnimeListEntry[]): Promise<RawS
 export interface MdblistData {
   movieRows: any[];
   episodeRows: any[];
+  showRows?: any[];
   /** MDBList's own up-next list; empty when it could not be read. */
   upNext: any[];
   droppedShows: any[];
@@ -430,16 +495,15 @@ export async function fetchMdblistUpNext(apiKey: string): Promise<any[]> {
 
 export async function fetchMdblistDropped(apiKey: string): Promise<{ shows: any[]; unread: boolean }> {
   const { makeRateLimitedMDBListRequest } = require('../../utils/mdbList');
+  const { readToEnd } = require('../../utils/readToEnd');
   const pageSize = envInt('JELLYFIN_WATCHED_PAGE_SIZE', 1000, 1);
-  const maxPages = envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1);
   const shows: any[] = [];
   try {
-    for (let offset = 0; offset < maxPages * pageSize; offset += pageSize) {
-      const response = await makeRateLimitedMDBListRequest(`https://api.mdblist.com/sync/dropped?limit=${pageSize}&offset=${offset}&apikey=${apiKey}`, apiKey, 'MDBList dropped');
-      const page = Array.isArray(response?.data?.shows) ? response.data.shows : [];
-      shows.push(...page);
-      if (page.length < pageSize) break;
-    }
+    shows.push(...await readToEnd('MDBList dropped', async (page: number) => {
+      const response = await makeRateLimitedMDBListRequest(`https://api.mdblist.com/sync/dropped?limit=${pageSize}&offset=${page * pageSize}&apikey=${apiKey}`, apiKey, 'MDBList dropped');
+      const items = Array.isArray(response?.data?.shows) ? response.data.shows : [];
+      return { items, more: items.length >= pageSize };
+    }));
     return { shows, unread: false };
   } catch (error: any) {
     logger.warn(`MDBList dropped shows failed: ${error?.message || error}`);
@@ -450,39 +514,59 @@ export async function fetchMdblistDropped(apiKey: string): Promise<{ shows: any[
 /** Every page of a user's MDBList watched history, optionally only what changed since a time. */
 export async function fetchMdblistWatched(apiKey: string, mediatype: 'episode' | 'movie' | 'show', since?: string): Promise<any[]> {
   const { makeRateLimitedMDBListRequest } = require('../../utils/mdbList');
+  const { readToEnd } = require('../../utils/readToEnd');
   const pageSize = envInt('JELLYFIN_WATCHED_PAGE_SIZE', 1000, 1);
-  const maxPages = envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1);
-  const collected: any[] = [];
   let cursor = '';
 
-  for (let page = 0; page < maxPages; page += 1) {
+  return readToEnd(`MDBList watched ${mediatype}`, async (page: number) => {
     const url =
       `https://api.mdblist.com/sync/watched?mediatype=${mediatype}` +
       `&limit=${pageSize}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}` +
       // Sent with every page: the cursor alone carries on into older history.
       `${since ? `&since=${encodeURIComponent(since)}` : ''}` +
+      `${mediatype === 'episode' ? '&append_to_response=tvdb' : ''}` +
       `&apikey=${apiKey}`;
     const response = await makeRateLimitedMDBListRequest(url, apiKey, `MDBList watched ${mediatype} page ${page + 1}`);
     const body = response?.data ?? {};
     const batch = body[`${mediatype}s`];
-    if (!Array.isArray(batch) || !batch.length) break;
-
-    collected.push(...batch);
     cursor = body?.pagination?.next_cursor ?? '';
-    if (!cursor) break;
-  }
-
-  return collected;
+    return { items: Array.isArray(batch) ? batch : [], more: Boolean(cursor) };
+  }, (item: any) => {
+    const ids = (item?.movie ?? item?.show ?? item?.episode?.show)?.ids;
+    const id = ids?.mdblist ?? ids?.imdb ?? ids?.tmdb;
+    if (!id) return JSON.stringify(item);
+    return item?.episode ? `${id}:${item.episode.season}:${item.episode.number}` : String(id);
+  });
 }
 
 export async function assembleMdblist(data: MdblistData, config: any): Promise<RawSnapshot> {
-  const { movieRows, episodeRows, upNext, droppedShows, droppedUnread } = data;
+  const { movieRows, episodeRows, showRows = [], upNext, droppedShows, droppedUnread } = data;
   const { Resolutions } = require('./resolutions');
+  const { mdblistEpisodeRef, mdblistWatchedRef, mdblistTvdbOrder } = require('../../utils/mdbList');
   const resolutions = new Resolutions();
+  const nextRefs = upNext.map((item: any) => mdblistEpisodeRef(item?.show, item?.next_episode));
+  const reordered = new Set<number>();
+  for (const entry of episodeRows) {
+    const episode = entry?.episode;
+    const linked = episode?.tvdb_ids;
+    const show = Number(episode?.show?.ids?.tmdb);
+    if (!show || !linked || !Number.isFinite(Number(linked.season))) continue;
+    if (Number(linked.season) !== Number(episode.season) || Number(linked.episode) !== Number(episode.number)) reordered.add(show);
+  }
+  const apiKey = require('../accounts').credentialOf(config, 'mdblist');
+  const orders = new Map<number, any>();
+  if (apiKey) for (const show of reordered) orders.set(show, await mdblistTvdbOrder(show, apiKey));
+  const watched: Array<{ entry: any; ref: any }> = [];
+  for (const entry of episodeRows) {
+    const episode = entry?.episode;
+    const places: any[] = orders.get(Number(episode?.show?.ids?.tmdb))?.get(`${episode?.season}:${episode?.number}`) ?? [null];
+    for (const place of places) watched.push({ entry, ref: await mdblistWatchedRef(episode, config, place) });
+  }
+  const watchedRefs = watched.map(({ ref }) => ref);
   await resolutions.preload(
     [
-      ...episodeRows.map((entry: any) => [entry?.episode?.show?.ids ?? {}, Number(entry?.episode?.season), Number(entry?.episode?.number)]),
-      ...upNext.map((item: any) => [item?.show?.ids ?? {}, Number(item?.next_episode?.season), Number(item?.next_episode?.episode)]),
+      ...watchedRefs.filter(Boolean).map((ref: any) => [ref.ids, ref.season, ref.episode, ref.tvdb ? 'tvdb' : 'tmdb']),
+      ...nextRefs.filter(Boolean).map((ref: any) => [ref.ids, ref.season, ref.episode, ref.tvdb ? 'tvdb' : 'tmdb']),
     ],
     []
   );
@@ -506,14 +590,14 @@ export async function assembleMdblist(data: MdblistData, config: any): Promise<R
   }
 
   const latest = new Map<string, { resolved: any; season: number; number: number; at: number }>();
-  for (const entry of episodeRows) {
-    const episode = entry?.episode;
-    const season = Number(episode?.season);
-    const number = Number(episode?.number);
-    const ids = episode?.show?.ids ?? {};
-    if (!Number.isFinite(season) || !Number.isFinite(number)) continue;
+  const byShow = new Map<string, { metaIds: Set<string>; anime: boolean; regular: number }>();
+  const counted = new Set<any>();
+  for (const { entry, ref } of watched) {
+    if (!ref) continue;
+    const { season, episode: number } = ref;
+    const ids = entry?.episode?.show?.ids ?? {};
 
-    const resolved = await resolutions.episode(ids, season, number, config);
+    const resolved = await resolutions.episode(ref.ids, season, number, config, ref.tvdb ? 'tvdb' : 'tmdb');
     if (!resolved) continue;
 
     episodes.add(resolved.videoId);
@@ -522,9 +606,19 @@ export async function assembleMdblist(data: MdblistData, config: any): Promise<R
     if (seen) at.set(resolved.videoId, seen);
     recordWatch(history, { kind: 'episode', id: resolved.videoId, metaId: resolved.metaId, mediaType: resolved.mediaType, at: seen });
     const counts = series.get(resolved.metaId) ?? { watched: 0, total: 0 };
-    counts.watched += 1;
+    if (!counted.has(entry)) {
+      counted.add(entry);
+      counts.watched += 1;
+    }
     if (seen && (!counts.at || seen > counts.at)) counts.at = seen;
     series.set(resolved.metaId, counts);
+    if (ids.mdblist) {
+      const show = byShow.get(String(ids.mdblist)) ?? { metaIds: new Set<string>(), anime: false, regular: 0 };
+      show.metaIds.add(resolved.metaId);
+      if (resolved.mediaType === 'anime') show.anime = true;
+      if (season > 0) show.regular += 1;
+      byShow.set(String(ids.mdblist), show);
+    }
 
     const held = latest.get(resolved.metaId);
     if (!held || seen > held.at || (seen === held.at && (season > held.season || (season === held.season && number > held.number)))) {
@@ -532,15 +626,23 @@ export async function assembleMdblist(data: MdblistData, config: any): Promise<R
     }
   }
 
+  for (const entry of showRows) {
+    const aired = Number(entry?.show?.total_aired_episodes) || 0;
+    const show = byShow.get(String(entry?.show?.ids?.mdblist ?? ''));
+    if (aired <= 0 || !show || show.anime || show.metaIds.size !== 1) continue;
+    const counts = series.get([...show.metaIds][0]);
+    if (counts) Object.assign(counts, { watched: show.regular, total: aired });
+  }
+
   // MDBList names the next episode itself, the one its own app shows. The
   // history seeds it only when that call fails: the last episode watched, from
   // which the shelf moves on.
   const nextUp: NextUpRow[] = [];
-  for (const item of upNext) {
-    const season = Number(item?.next_episode?.season);
-    const number = Number(item?.next_episode?.episode);
-    if (!Number.isFinite(season) || !Number.isFinite(number)) continue;
-    const resolved = await resolutions.episode(item?.show?.ids ?? {}, season, number, config);
+  for (const [index, item] of upNext.entries()) {
+    const ref = nextRefs[index];
+    if (!ref) continue;
+    const { season, episode: number } = ref;
+    const resolved = await resolutions.episode(ref.ids, season, number, config, ref.tvdb ? 'tvdb' : 'tmdb');
     if (!resolved) continue;
     const total = Number(item?.progress?.total_episode_count) || 0;
     if (total > 0) {
@@ -555,6 +657,7 @@ export async function assembleMdblist(data: MdblistData, config: any): Promise<R
       episode: resolved.mediaType === 'anime' ? Number(String(resolved.videoId).split(':').pop()) : number,
       mediaType: resolved.mediaType,
       lastWatchedAt: Date.parse(item?.last_watched_at ?? '') || 0,
+      trackerRank: index,
     });
   }
   if (!upNext.length) {
@@ -599,7 +702,9 @@ export async function assembleMdblist(data: MdblistData, config: any): Promise<R
 type MirroredService = 'simkl' | 'mdblist' | 'publicmetadb' | 'anilist' | 'mal';
 
 // Raised to rebuild indexes written in an older spelling.
-const INDEX_FORMAT = 2;
+const INDEX_FORMAT = 9;
+const SERVICE_FORMATS: Partial<Record<MirroredService, number>> = { publicmetadb: 10 };
+const formatOf = (service: MirroredService): number => SERVICE_FORMATS[service] ?? INDEX_FORMAT;
 
 interface SummaryData {
   format?: number;
@@ -607,6 +712,8 @@ interface SummaryData {
   following: Array<{ metaId: string; mediaType: 'anime' | 'series' }>;
   dropped: string[];
   droppedUnread?: boolean;
+  finishedAnime?: FinishedAnime[];
+  listedAnime?: string[];
 }
 
 const summaries = new LRUCache<string, WatchedSnapshot>({ max: envInt('JELLYFIN_WATCHED_CACHE_MAX', 200, 1) });
@@ -620,6 +727,7 @@ function viewOf(source: string, fingerprint: string, data: SummaryData): Watched
     following: data?.following ?? [],
     dropped: new Set(data?.dropped ?? []),
     droppedUnread: data?.droppedUnread === true,
+    ...(data?.finishedAnime ? { finishedAnime: data.finishedAnime, listedAnime: new Set(data.listedAnime ?? []) } : {}),
     fingerprint,
   };
 }
@@ -648,18 +756,20 @@ async function assembleFromMirror(service: MirroredService, credential: string, 
   if (service === 'mdblist') {
     const movieRows: any[] = [];
     const episodeRows: any[] = [];
+    const showRows: any[] = [];
     let upNext: any[] = [];
     let dropped: any = { shows: [], unread: false };
     for (const row of rows) {
       if (row.key.startsWith('movie:')) movieRows.push(row.data);
       else if (row.key.startsWith('ep:')) episodeRows.push(row.data);
+      else if (row.key.startsWith('showinfo:')) showRows.push(row.data);
       else if (row.key === 'upnext') upNext = Array.isArray(row.data) ? row.data : [];
       else if (row.key === 'dropped') dropped = row.data ?? dropped;
     }
     movieRows.sort(byTime('last_watched_at'));
     episodeRows.sort(byTime('last_watched_at'));
     // MDBList names no followed shows.
-    return { ...(await assembleMdblist({ movieRows, episodeRows, upNext, droppedShows: dropped.shows ?? [], droppedUnread: dropped.unread === true }, config)), following: [] };
+    return { ...(await assembleMdblist({ movieRows, episodeRows, showRows, upNext, droppedShows: dropped.shows ?? [], droppedUnread: dropped.unread === true }, config)), following: [] };
   }
   if (service === 'anilist' || service === 'mal') {
     return assembleAnimeList(rows.filter((row) => row.key.startsWith('entry:')).map((row) => row.data));
@@ -766,16 +876,25 @@ async function writeIndex(source: string, raw: RawSnapshot): Promise<{ added: nu
 
 async function buildIndex(service: MirroredService, credential: string, config: any, source: string, version: number): Promise<WatchedSnapshot> {
   const database: any = require('../database');
-  const fingerprint = `store:${source}:v${version}`;
+  const format = formatOf(service);
+  const fingerprint = `store:${source}:v${version}:f${format}`;
   const stored = await database.getWatchSummary(source);
-  if (stored?.version === version && stored.data?.format === INDEX_FORMAT) return viewOf(source, fingerprint, stored.data);
+  const current = stored?.data?.format === format;
+  if (stored?.version === version && current) return viewOf(source, fingerprint, stored.data);
 
   const started = Date.now();
   const raw = await assembleFromMirror(service, credential, config);
   const { pendingWatches } = require('../trackerOutbox');
   withPending(raw, await pendingWatches(service, credential).catch(() => []));
   const written = await writeIndex(source, raw);
-  const data: SummaryData = { format: INDEX_FORMAT, nextUp: raw.nextUp ?? [], following: raw.following ?? [], dropped: raw.dropped ?? [], droppedUnread: raw.droppedUnread === true };
+  const data: SummaryData = {
+    format,
+    nextUp: raw.nextUp ?? [],
+    following: raw.following ?? [],
+    dropped: raw.dropped ?? [],
+    droppedUnread: raw.droppedUnread === true,
+    ...(raw.finishedAnime ? { finishedAnime: raw.finishedAnime, listedAnime: raw.listedAnime ?? [] } : {}),
+  };
   // Written last: an index left half-written by a crash is rebuilt, since its version never lands.
   await database.putWatchSummary(source, version, data);
   logger.debug(`Watch index for ${service} ${source.slice(-8)} at version ${version}: ${raw.episodes.length} episodes, ${raw.movies.length} films, ${written.added} rows written and ${written.removed} removed in ${Date.now() - started}ms`);
@@ -795,11 +914,11 @@ async function storeSnapshot(userUUID: string, config: any, service: MirroredSer
     if (!version) {
       const database: any = require('../database');
       const stored = await database.getWatchSummary(source).catch(() => null);
-      return stored ? viewOf(source, `store:${source}:v${stored.version}`, stored.data) : EMPTY;
+      return stored ? viewOf(source, `store:${source}:v${stored.version}:f${stored.data?.format}`, stored.data) : EMPTY;
     }
   }
 
-  const key = `store:${source}:v${version}`;
+  const key = `store:${source}:v${version}:f${formatOf(service)}`;
   const memo = summaries.get(key);
   if (memo) return memo;
   const prior = indexBuilds.get(source) ?? Promise.resolve();
@@ -889,25 +1008,31 @@ export type UpcomingRow = Omit<NextUpRow, 'lastWatchedAt'>;
  * Shows the tracker follows with an episode on the way, and that episode: watchlisted,
  * in progress or caught up. Whether one counts as upcoming is the shelf's call.
  */
-export async function upcomingFollowed(config: any, days: number): Promise<UpcomingRow[]> {
+function upcomingFeedKey(config: any, days: number): string | null {
   const { readsTrackers } = require('./profiles');
-  if (!readsTrackers(config) || sourceFor(config) !== 'mdblist') return [];
+  if (!readsTrackers(config) || sourceFor(config) !== 'mdblist') return null;
   const apiKey = credentialFor(config, 'mdblist');
-  if (!apiKey) return [];
+  if (!apiKey) return null;
+  return `jellyfin_upcoming_mdblist_v4:${createHash('sha256').update(apiKey).digest('hex').substring(0, 16)}:${days}`;
+}
+
+export async function upcomingFollowed(config: any, days: number): Promise<UpcomingRow[]> {
+  const key = upcomingFeedKey(config, days);
+  if (!key) return [];
+  const apiKey = credentialFor(config, 'mdblist');
 
   const { cacheWrapGlobal, classifyResultAllowEmpty } = require('../getCache');
-  const keyHash = createHash('sha256').update(apiKey).digest('hex').substring(0, 16);
   try {
     return await cacheWrapGlobal(
-      `jellyfin_upcoming_mdblist_v3:${keyHash}:${days}`,
+      key,
       async () => {
-        const { fetchMDBListUpcoming } = require('../../utils/mdbList');
+        const { fetchMDBListUpcoming, mdblistEpisodeRef } = require('../../utils/mdbList');
         const out: UpcomingRow[] = [];
         for (const item of await fetchMDBListUpcoming(apiKey, days)) {
-          const season = Number(item?.next_episode?.season);
-          const episode = Number(item?.next_episode?.episode);
-          if (!Number.isFinite(season) || !Number.isFinite(episode)) continue;
-          const resolved = await videoIdFor(item?.show?.ids ?? {}, season, episode, config);
+          const ref = mdblistEpisodeRef(item?.show, item?.next_episode);
+          if (!ref) continue;
+          const { season, episode } = ref;
+          const resolved = await videoIdFor(ref.ids, season, episode, config, undefined, ref.tvdb ? 'tvdb' : 'tmdb');
           if (!resolved) continue;
           // Numbered as Next Up numbers them: anime by its own video, the rest by season and episode.
           out.push({
@@ -930,6 +1055,12 @@ export async function upcomingFollowed(config: any, days: number): Promise<Upcom
   }
 }
 
+export async function forgetUpcomingFollowed(config: any): Promise<void> {
+  const key = upcomingFeedKey(config, envInt('JELLYFIN_UPCOMING_DAYS', 90, 1));
+  const redis: any = require('../redisClient');
+  if (key && redis) await redis.del(`global:${key}`);
+}
+
 // The newest play of a show seeds Next Up, which moves on from it.
 export interface PmdbData {
   rows: any[];
@@ -939,14 +1070,13 @@ export interface PmdbData {
 
 export async function fetchPmdbDropped(apiKey: string): Promise<{ items: any[]; unread: boolean }> {
   const { fetchDropped } = require('../../utils/publicmetadbUtils');
-  const maxPages = envInt('JELLYFIN_WATCHED_MAX_PAGES', 50, 1);
+  const { readToEnd } = require('../../utils/readToEnd');
   const items: any[] = [];
   try {
-    for (let page = 1; page <= maxPages; page += 1) {
-      const result = await fetchDropped(apiKey, page, 100);
-      items.push(...result.items);
-      if (page >= result.totalPages || !result.items.length) break;
-    }
+    items.push(...await readToEnd('PublicMetaDB dropped', async (page: number) => {
+      const result = await fetchDropped(apiKey, page + 1, 100);
+      return { items: result.items, more: page + 1 < result.totalPages };
+    }));
     return { items, unread: false };
   } catch (error: any) {
     logger.warn(`PublicMetaDB dropped shows failed: ${error?.message || error}`);
@@ -954,13 +1084,52 @@ export async function fetchPmdbDropped(apiKey: string): Promise<{ items: any[]; 
   }
 }
 
+/** A show's aired episodes on TMDB, specials left out. */
+async function tmdbAiredEpisodes(tmdbId: number, config: any): Promise<number> {
+  const { tvInfo } = require('../getTmdb');
+  const detail = await tvInfo({ id: tmdbId }, config);
+  const last = detail?.last_episode_to_air;
+  const lastSeason = Number(last?.season_number);
+  if (!(lastSeason > 0)) return 0;
+  const before = (Array.isArray(detail?.seasons) ? detail.seasons : [])
+    .filter((season: any) => Number(season?.season_number) > 0 && Number(season.season_number) < lastSeason)
+    .reduce((sum: number, season: any) => sum + (Number(season?.episode_count) || 0), 0);
+  return before + (Number(last?.episode_number) || 0);
+}
+
+type EpisodePlace = { season: number; episode: number };
+
+async function pmdbTvdbOrders(rows: any[], config: any): Promise<Map<number, Map<string, EpisodePlace[]>>> {
+  const orders = new Map<number, Map<string, EpisodePlace[]>>();
+  const apiKey = require('../accounts').credentialOf(config, 'mdblist');
+  if (!apiKey || config?.providers?.series !== 'tvdb') return orders;
+  const { mdblistTvdbOrder } = require('../../utils/mdbList');
+  const { canonicalIds } = require('./canonicalIds');
+  const { withEpisodeOrder } = require('../../utils/episodeOrder');
+  const idMapper: any = require('../id-mapper');
+  const shows = new Set<number>(rows.filter((row: any) => row?.tmdb_id && row.media_type !== 'movie' && Number(row?.season) > 0).map((row: any) => Number(row.tmdb_id)));
+  for (const tmdb of shows) {
+    if (idMapper.getMappingByTmdbId(String(tmdb), 'series')) continue;
+    const ids = await canonicalIds({ tmdb }, 'series', config).catch(() => ({} as Record<string, any>));
+    if ((withEpisodeOrder(config, Number(ids.tvdb) || null).tvdbSeasonType || 'default') !== 'default') continue;
+    const order = await mdblistTvdbOrder(tmdb, apiKey).catch(() => null);
+    if (order) orders.set(tmdb, order);
+  }
+  return orders;
+}
+
 /** A user's PublicMetaDB plays and drops made into a snapshot; plays newest first. */
 export async function assemblePmdb(data: PmdbData, config: any): Promise<RawSnapshot> {
   const { rows, droppedItems, droppedUnread } = data;
   const { Resolutions } = require('./resolutions');
   const resolutions = new Resolutions();
+  const orders = await pmdbTvdbOrders(rows, config);
+  const placesOf = (row: any): EpisodePlace[] | null => orders.get(Number(row.tmdb_id))?.get(`${Number(row?.season)}:${Number(row?.episode)}`) ?? null;
   await resolutions.preload(
-    rows.filter((row: any) => row?.tmdb_id && row.media_type !== 'movie').map((row: any) => [{ tmdb: row.tmdb_id }, Number(row?.season), Number(row?.episode)]),
+    rows.filter((row: any) => row?.tmdb_id && row.media_type !== 'movie').flatMap((row: any) => {
+      const places = placesOf(row);
+      return places ? places.map((place) => [{ tmdb: row.tmdb_id }, place.season, place.episode, 'tvdb']) : [[{ tmdb: row.tmdb_id }, Number(row?.season), Number(row?.episode)]];
+    }),
     rows.filter((row: any) => row?.tmdb_id && row.media_type === 'movie').map((row: any) => row.tmdb_id)
   );
   if (!rows.length) logger.debug('No watched history on PublicMetaDB');
@@ -970,6 +1139,7 @@ export async function assemblePmdb(data: PmdbData, config: any): Promise<RawSnap
   const seen = new Map<string, number>();
   const series = new Map<string, { watched: number; total: number; at?: number }>();
   const latest = new Map<string, { row: any; at: number }>();
+  const byShow = new Map<number, { metaIds: Set<string>; anime: boolean; regular: number }>();
   const history = new Map<string, HistoryEntry>();
   const followedSince = Date.now() - envInt('JELLYFIN_NEXTUP_OWN_DAYS', 120, 1) * 24 * 60 * 60 * 1000;
 
@@ -987,23 +1157,41 @@ export async function assemblePmdb(data: PmdbData, config: any): Promise<RawSnap
       recordWatch(history, { kind: 'movie', id: base, mediaType: 'movie', at });
       continue;
     }
-    const season = Number(row?.season);
-    const episode = Number(row?.episode);
-    if (!Number.isFinite(season) || !Number.isFinite(episode)) continue;
-    const resolved = await resolutions.episode({ tmdb: row.tmdb_id }, season, episode, config);
-    if (!resolved) continue;
-    if (episodes.has(resolved.videoId)) continue;
-    episodes.add(resolved.videoId);
-    if (at) seen.set(resolved.videoId, at);
-    recordWatch(history, { kind: 'episode', id: resolved.videoId, metaId: resolved.metaId, mediaType: resolved.mediaType, at });
+    const played = Number(row?.season);
+    if (!Number.isFinite(played) || !Number.isFinite(Number(row?.episode))) continue;
+    const places = placesOf(row);
+    const targets = places ? places.map((place) => ({ ...place, numbering: 'tvdb' })) : [{ season: played, episode: Number(row.episode), numbering: 'tmdb' }];
+    let tallied = false;
+    for (const { season, episode, numbering } of targets) {
+      const resolved = await resolutions.episode({ tmdb: row.tmdb_id }, season, episode, config, numbering);
+      if (!resolved) continue;
+      if (episodes.has(resolved.videoId)) continue;
+      episodes.add(resolved.videoId);
+      if (at) seen.set(resolved.videoId, at);
+      recordWatch(history, { kind: 'episode', id: resolved.videoId, metaId: resolved.metaId, mediaType: resolved.mediaType, at });
 
-    const counts = series.get(resolved.metaId) ?? { watched: 0, total: 0 };
-    counts.watched += 1;
-    series.set(resolved.metaId, counts);
+      const counts = series.get(resolved.metaId) ?? { watched: 0, total: 0 };
+      counts.watched += 1;
+      series.set(resolved.metaId, counts);
+      const show = byShow.get(Number(row.tmdb_id)) ?? { metaIds: new Set<string>(), anime: false, regular: 0 };
+      show.metaIds.add(resolved.metaId);
+      if (resolved.mediaType === 'anime') show.anime = true;
+      if (played > 0 && !tallied) show.regular += 1;
+      tallied = true;
+      byShow.set(Number(row.tmdb_id), show);
 
-    const held = latest.get(resolved.metaId);
-    if (!held || at > held.at) latest.set(resolved.metaId, { row: { ...resolved, season, episode }, at });
+      const held = latest.get(resolved.metaId);
+      if (!held || at > held.at) latest.set(resolved.metaId, { row: { ...resolved, season, episode }, at });
+    }
   }
+
+  const { mapWithConcurrency } = require('../../utils/concurrency');
+  const whole = [...byShow].filter(([, show]) => !show.anime && show.metaIds.size === 1);
+  await mapWithConcurrency(whole, envInt('JELLYFIN_SHELF_META_CONCURRENCY', 4, 1), async ([tmdbId, show]: [number, { metaIds: Set<string>; regular: number }]) => {
+    const aired = await tmdbAiredEpisodes(tmdbId, config).catch(() => 0);
+    const counts = series.get([...show.metaIds][0]);
+    if (aired > 0 && counts) Object.assign(counts, { watched: show.regular, total: aired });
+  });
 
   const nextUp: NextUpRow[] = [];
   const following: Array<{ metaId: string; mediaType: 'anime' | 'series' }> = [];
@@ -1137,8 +1325,12 @@ export async function watchedSnapshot(userUUID: string, config: any, opts: { pat
   }
 
   // Kept out of what is held: a drop made here shows on the next read.
-  const { dropsKeptHere, localDrops } = require('./dropped');
-  if (!userUUID || !dropsKeptHere(config)) return snapshot;
+  const { dropsKeptHere, localDrops, withHeldDrops } = require('./dropped');
+  if (!userUUID) return snapshot;
+  if (!dropsKeptHere(config)) {
+    const dropped = withHeldDrops(userUUID, config, snapshot.dropped);
+    return dropped === snapshot.dropped ? snapshot : { ...snapshot, dropped };
+  }
   const local: Set<string> = await localDrops(userUUID, config);
   return local.size ? { ...snapshot, dropped: new Set([...snapshot.dropped, ...local]) } : snapshot;
 }
@@ -1209,7 +1401,7 @@ async function clearUnmarked(userUUID: string, profile: string, config: any, bef
 
   const database: any = require('../database');
   const { parseStremioId } = require('./ids');
-  const { videoIdAliases } = require('./aliases');
+  const { videoIdAliases, groupBySpelling } = require('./aliases');
   let cleared = 0;
   for (const id of gone) {
     const parsed = parseStremioId(id);
@@ -1229,7 +1421,7 @@ async function clearUnmarked(userUUID: string, profile: string, config: any, bef
   return cleared;
 }
 
-async function movieSpellings(id: string, config: any): Promise<string[]> {
+export async function movieSpellings(id: string, config: any): Promise<string[]> {
   try {
     const { resolveAllIds } = require('../id-resolver');
     const ids = await resolveAllIds(id, 'movie', config, {}, [id.startsWith('tmdb:') ? 'imdb' : 'tmdb']);
@@ -1330,12 +1522,13 @@ export async function invalidateWatched(config: any): Promise<void> {
  * item's own guid, so this stays one pass over a finished list rather than a
  * parameter threaded through every builder.
  */
-function airedFrom(videos: any[]): string[] {
+function airedFrom(videos: any[], season?: number): string[] {
   const now = Date.now();
-  const dates = videos.some((v: any) => Number(v?.season) !== 0 && Number.isFinite(Date.parse(v?.released ?? v?.firstAired ?? '')));
+  const counted = (v: any) => (season === undefined ? Number(v?.season) !== 0 : Number(v?.season) === season);
+  const dates = videos.some((v: any) => counted(v) && Number.isFinite(Date.parse(v?.released ?? v?.firstAired ?? '')));
   return videos
     .filter((v: any) => {
-      if (Number(v?.season) === 0) return false;
+      if (!counted(v)) return false;
       const at = Date.parse(v?.released ?? v?.firstAired ?? '');
       if (!Number.isFinite(at)) return !dates;
       return at <= now;
@@ -1349,10 +1542,10 @@ function airedFrom(videos: any[]): string[] {
  * A listing never builds one: that is a full meta read per show on the page, all
  * competing with the page itself. Started shows are queued instead.
  */
-async function airedEpisodeIds(userUUID: string, descriptor: any): Promise<string[] | null> {
+async function indexedVideos(userUUID: string, metaId: string): Promise<any[] | null> {
   const { seriesIndex } = require('./episodeIndex');
-  const indexed = await seriesIndex(userUUID, String(descriptor.i), { held: true }).catch(() => null);
-  return indexed ? airedFrom(Array.isArray(indexed.videos) ? indexed.videos : []) : null;
+  const indexed = await seriesIndex(userUUID, metaId, { held: true }).catch(() => null);
+  return indexed ? (Array.isArray(indexed.videos) ? indexed.videos : []) : null;
 }
 
 const ownPlayedMemo = new LRUCache<string, Set<string>>({
@@ -1402,7 +1595,8 @@ export async function applyWatchedState(
   snapshot: WatchedSnapshot,
   userUUID?: string,
   profile = '',
-  config?: any
+  config?: any,
+  opts: { indexWaitMs?: number; seriesVideos?: Map<string, any[]> } = {}
 ): Promise<void> {
   if (!items.length) return;
 
@@ -1439,33 +1633,47 @@ export async function applyWatchedState(
     ? await trackerPositions(userUUID, config).catch(() => new Map())
     : new Map();
 
-  const ownPlayed = userUUID && [...descriptors.values()].some((d) => d.k === 'series')
+  const ownPlayed = userUUID && [...descriptors.values()].some((d) => d.k === 'series' || d.k === 'season')
     ? await ownPlayedEpisodes(userUUID, profile)
     : new Set<string>();
 
   // The page's titles are asked of the watch index together: each film and episode, the
   // series counts, then each held show's aired episodes, other spellings only for a miss.
-  const seriesDescriptors = [...descriptors.values()].filter((d) => d.k === 'series');
-  const seriesCounts = await seriesCountsAmong(snapshot, seriesDescriptors.map((d) => String(d.i)));
+  const showIds = [...new Set([...descriptors.values()].filter((d) => d.k === 'series' || d.k === 'season').map((d) => String(d.i)))];
+  const seriesCounts = await seriesCountsAmong(snapshot, showIds);
   const ownUnwatched = userUUID && seriesCounts.size ? await ownUnwatchedEpisodes(userUUID, profile) : new Map<string, number>();
-  const airedBySeries = new Map<string, string[] | null>();
+  const videosBySeries = new Map<string, any[] | null>();
   if (userUUID) {
-    await Promise.all(seriesDescriptors.map(async (d) => {
-      if (seriesCounts.has(String(d.i)) || ownPlayed.size) airedBySeries.set(String(d.i), await airedEpisodeIds(userUUID, d));
+    await Promise.all(showIds.map(async (metaId) => {
+      if (seriesCounts.has(metaId) || ownPlayed.size) {
+        videosBySeries.set(metaId, (await indexedVideos(userUUID, metaId)) ?? opts.seriesVideos?.get(metaId) ?? null);
+      }
     }));
-    const missing = [...airedBySeries.entries()].filter(([, aired]) => !aired).map(([metaId]) => metaId);
+    const missing = [...videosBySeries.entries()].filter(([, videos]) => !videos).map(([metaId]) => metaId);
     const playedShows = missing.length && ownPlayed.size ? new Set([...ownPlayed].map((id) => id.replace(/:\d+:\d+$/, ''))) : new Set<string>();
     const started = missing.filter((metaId) => seriesCounts.has(metaId) || playedShows.has(metaId));
-    if (started.length) require('./episodeIndex').queueSeriesIndex(userUUID, started);
+    if (started.length && opts.indexWaitMs) {
+      await require('./episodeIndex').indexSeriesWithin(userUUID, started, opts.indexWaitMs);
+      await Promise.all(started.map(async (metaId) => videosBySeries.set(metaId, await indexedVideos(userUUID, metaId))));
+    } else if (started.length) {
+      require('./episodeIndex').queueSeriesIndex(userUUID, started);
+    }
   }
+  const airedBySeries = new Map<string, string[] | null>(
+    [...videosBySeries.entries()].map(([metaId, videos]) => [metaId, videos ? airedFrom(videos) : null])
+  );
+  const specials = [...descriptors.values()]
+    .filter((d) => d.k === 'season' && d.s === 0)
+    .flatMap((d) => airedFrom(videosBySeries.get(String(d.i)) ?? [], 0));
+  const showEpisodes = [...[...airedBySeries.values()].flatMap((ids) => ids ?? []), ...specials];
   const direct = [
     ...[...descriptors.values()].filter((d) => d.k === 'movie' || d.k === 'episode').map((d) => stremioIdFor(d)).filter(Boolean) as string[],
-    ...[...airedBySeries.values()].flatMap((ids) => ids ?? []),
+    ...showEpisodes,
   ];
   const watched = await watchedAmong(snapshot, direct);
   const aliasesOf = new Map<string, string[]>();
-  const { videoIdAliases } = require('./aliases');
-  for (const videoId of new Set([...airedBySeries.values()].flatMap((ids) => ids ?? []))) {
+  const { videoIdAliases, groupBySpelling } = require('./aliases');
+  for (const videoId of new Set(showEpisodes)) {
     if (!watched.has(videoId) && !ownPlayed.has(videoId)) aliasesOf.set(videoId, await videoIdAliases(videoId));
   }
   for (const [id, at] of await watchedAmong(snapshot, [...aliasesOf.values()].flat())) watched.set(id, at);
@@ -1509,6 +1717,21 @@ export async function applyWatchedState(
           UnplayedItemCount: unplayed,
           Played: unplayed === 0,
           PlayedPercentage: Math.min(100, (watchedCount / total) * 100),
+        };
+        return;
+      }
+
+      if (descriptor.k === 'season') {
+        const videos = videosBySeries.get(String(descriptor.i));
+        const aired = videos ? airedFrom(videos, descriptor.s) : [];
+        if (!aired.length) return;
+        const watchedCount = aired.filter((videoId) => playedUnderAnySpelling(videoId)).length;
+        const unplayed = aired.length - watchedCount;
+        item.UserData = {
+          ...item.UserData,
+          UnplayedItemCount: unplayed,
+          Played: unplayed === 0,
+          PlayedPercentage: (watchedCount / aired.length) * 100,
         };
         return;
       }

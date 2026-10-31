@@ -1,4 +1,4 @@
-import type { BuilderEntry } from '@shared/types';
+import type { BuilderEntry, CatalogRowOptions } from '@shared/types';
 
 export type TagColorKey =
   | 'blue' | 'green' | 'red' | 'violet' | 'amber' | 'cyan'
@@ -13,6 +13,11 @@ export interface TagDef {
   ageRating?: string;
   /** Only meaningful alongside ageRating. Absent means unrated titles show. */
   allowUnratedContent?: boolean;
+  viewingHours?: { start: string; end: string };
+  allowDownloads?: boolean;
+  hideKeywords?: string[];
+  hideWords?: string[];
+  hideGenres?: string[];
 }
 
 export type CardService = 'simkl' | 'mdblist' | 'publicmetadb' | 'anilist' | 'mal';
@@ -64,7 +69,7 @@ export interface CatalogConfig {
   type: 'movie' | 'series' | 'anime' | 'all';
   enabled: boolean;
   tags?: string[];
-  source: 'tmdb' | 'tvdb' | 'mal' | 'tvmaze' | 'mdblist' | 'trakt' | 'streaming' | 'stremthru' | 'custom' | 'anilist' | 'letterboxd' | 'simkl' | 'movielens' | 'flixpatrol' | 'publicmetadb' | 'recommendations' | 'merged' | 'lumiere'; // Keep source as the display label
+  source: 'tmdb' | 'tvdb' | 'mal' | 'tvmaze' | 'mdblist' | 'trakt' | 'streaming' | 'stremthru' | 'custom' | 'anilist' | 'letterboxd' | 'simkl' | 'movielens' | 'flixpatrol' | 'publicmetadb' | 'recommendations' | 'merged' | 'lumiere' | 'aiom'; // Keep source as the display label
   sourceUrl?: string; // Store the actual URL for StremThru and custom catalogs
   showInHome: boolean;
   genres?: string[]; // Optional genres array for catalogs that support genre filtering
@@ -93,6 +98,7 @@ export interface CatalogConfig {
   pageSize?: number;
   /** If set, this catalog is absorbed into a merged catalog and hidden from UI/manifest */
   mergedInto?: string;
+  row?: CatalogRowOptions;
   // List metadata (item count, privacy, author, description, AniList-specific fields, Trakt Up Next settings, Letterboxd-specific fields, TMDB-specific fields)
   metadata?: {
     itemCount?: number;
@@ -107,6 +113,7 @@ export interface CatalogConfig {
     useUpstreamArt?: boolean;
     // Trakt Up Next metadata
     useShowPosterForUpNext?: boolean;
+    upNextSort?: 'watched' | 'aired';
     includeAnimeInUpNext?: boolean;
     // Trakt Calendar metadata
     airingSoonDays?: number;
@@ -143,6 +150,7 @@ export interface CatalogConfig {
     interval?: 'today' | 'week' | 'month';
     pageSize?: number; // Results per page for Simkl trending and watchlist catalogs (default: 50)
     status?: 'watching' | 'plantowatch' | 'hold' | 'completed' | 'dropped'; // Status for Simkl watchlist catalogs
+    watchlistSort?: 'added' | 'released' | 'released_asc';
     /** Source references for merged catalogs (id starts with 'merged.') */
     mergedSources?: Array<{
       catalogId: string;       // source catalog id, e.g. "tmdb.top"
@@ -171,6 +179,7 @@ export interface CatalogConfig {
     pickMinVotes?: number;
     /** Only offered to a Jellyfin card that holds the account backing this catalog. */
     accountsOnly?: boolean;
+    accountOwner?: string;
   };
 }
 
@@ -223,8 +232,10 @@ export interface AppConfig {
   showPrefix: boolean;
   showMetaProviderAttribution: boolean;
   hideErrors?: boolean;
+  criticRatings?: boolean;
   castCount: number;
   displayAgeRating: boolean;
+  contentRatingCountry?: string;
   providers: {
     movie: string;
     series: string;
@@ -253,11 +264,15 @@ export interface AppConfig {
     originalLangFallback: boolean;
   };
   tvdbSeasonType: string;
+  animeEpisodeDates?: 'provider' | 'earliest' | 'dub';
   tvdbEpisodeOrders?: Record<string, string>;
+  tvdbNormalizeYearSeasons?: boolean;
+  tvdbShowSeasonNumbering?: Record<string, 'years' | 'sequential'>;
   mal: {
     skipFiller: boolean;
     skipRecap: boolean;
     allowEpisodeMarking: boolean;
+    skipMixedFiller?: boolean;
     /** If true, prefer IMDb IDs for catalog and search items when available */
     useImdbIdForCatalogAndSearch?: boolean;
   };
@@ -339,7 +354,8 @@ export interface AppConfig {
     gemini_model?: string;
     openrouter_model?: string;
     /** Which watch histories the profile is built from. */
-    sources?: 'simkl' | 'mdblist' | 'both';
+    sources?: 'simkl' | 'mdblist' | 'both' | 'local';
+    profiles?: Record<string, { sources?: 'same' | 'simkl' | 'mdblist' | 'both' | 'local' }>;
     /** Gemini google_search grounding, or the OpenRouter :online suffix. Off unless set. */
     web_search?: boolean;
     /**
@@ -347,7 +363,7 @@ export interface AppConfig {
      * counted against the same reply budget as the answer, so a high setting
      * can leave a long list with no room to finish. OpenRouter only.
      */
-    reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high';
+    reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
     /**
      * How much a series left unfinished counts against it. Stalling is weak
      * evidence: people stop because a season ended or they forgot, not only
@@ -374,7 +390,7 @@ export interface AppConfig {
   timezone?: string;
   catalogs: CatalogConfig[];
   deletedCatalogs?: string[];
-  /** Collections and rows built in the Collections editor, exported as Nuvio or Fusion JSON */
+  /** Collections and rows built in the Collections editor, served to Jellyfin clients and exported as Nuvio JSON */
   collections?: BuilderEntry[];
   /** Serve the collection layout's images through this instance's image cache. */
   collectionImagesViaCache?: boolean;
@@ -437,6 +453,9 @@ export interface AppConfig {
   /** Install URL of a stream addon the Jellyfin server delegates playback to. */
   jellyfinStreamUrl?: string;
   jellyfinResolveOnOpen?: boolean;
+  jellyfinUpcomingMode?: 'airing';
+  /** Where a title's similar titles come from. TMDB when unset. */
+  jellyfinSimilarSource?: 'simkl';
   jellyfinLatestRows?: boolean;
   jellyfinMarkUnaired?: boolean;
   /** Playback is reported by the client, so the subtitle trigger is not used. */
@@ -448,6 +467,8 @@ export interface AppConfig {
   /** Name and picture of the main Jellyfin user, the configuration itself. */
   jellyfinUserName?: string;
   jellyfinUserAvatar?: string;
+  /** The main user's PIN: 4 to 12 digits as typed, or the hash the server saved it as. */
+  jellyfinUserPin?: string;
   jellyfinUserTags?: string[];
   jellyfinUserHandoffNames?: string[];
   jellyfinSkipSource?: SkipSource;

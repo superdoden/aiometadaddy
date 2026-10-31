@@ -19,12 +19,15 @@ const buildInfo: any = require('../buildInfo');
 /** The AIOStreams Jellyfin extensions this server offers, each with its version. */
 const EXTENSIONS = {
   users: 1,
+  history: 1,
   playedUpTo: 1,
   dropped: 1,
   refreshVersions: 1,
   versions: 1,
   genreRequired: 1,
   ranked: 1,
+  watchlistFavorites: 1,
+  fillers: 1,
 } as const;
 
 export function extensionInfo(origin: string): any {
@@ -32,7 +35,7 @@ export function extensionInfo(origin: string): any {
     logo: process.env.ADDON_LOGO_URL?.trim() || `${origin}/logo.png`,
     configureUrl: `${origin}/configure`,
     pinSignIn: false,
-    features: EXTENSIONS,
+    features: require('../criticRatings').criticRatingsEnabled() ? { ...EXTENSIONS, criticRatings: 1 } : EXTENSIONS,
     version: { tag: `v${buildInfo.version}` },
   };
 }
@@ -65,6 +68,10 @@ export function systemInfo(serverId: string, localAddress: string): any {
 export function userConfiguration(): any {
   return {
     PlayDefaultAudioTrack: true,
+    AudioLanguages: [],
+    SubtitleLanguages: [],
+    SubtitleTypes: [],
+    ListPreferredSubtitlesOnly: false,
     SubtitleLanguagePreference: '',
     DisplayMissingEpisodes: false,
     GroupedFolders: [],
@@ -105,7 +112,7 @@ export function userPolicy(): any {
     ForceRemoteSourceTranscoding: false,
     EnableContentDeletion: false,
     EnableContentDeletionFromFolders: [],
-    EnableContentDownloading: false,
+    EnableContentDownloading: true,
     EnableSyncTranscoding: false,
     EnableMediaConversion: false,
     EnabledDevices: [],
